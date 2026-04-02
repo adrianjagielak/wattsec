@@ -536,9 +536,12 @@ class PowerMonitor: ObservableObject {
     private var timer: AnyCancellable?
     private var smoothingAlpha: Double = PaceLevel.medium.smoothingAlpha
     private var isFirstReading = true
+    private var wasCharging = false
 
     /// Fixed sample interval (200ms = 5 updates/sec)
     private static let sampleInterval: TimeInterval = 0.2
+    /// Threshold for detecting charger connected
+    private static let chargingThreshold: Double = 1.0
 
     private init() {
         setupTimer()
@@ -554,10 +557,14 @@ class PowerMonitor: ObservableObject {
             let rawDcIn = max(0.0, SMC.shared.getValue("PDTR") ?? 0.0)
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                if self.isFirstReading {
+                let nowCharging = rawDcIn > Self.chargingThreshold
+
+                // Reset smoothing on charger connect/disconnect
+                if self.isFirstReading || nowCharging != self.wasCharging {
                     self.wattage = rawSystem
                     self.dcInWattage = rawDcIn
                     self.isFirstReading = false
+                    self.wasCharging = nowCharging
                 } else {
                     let alpha = self.smoothingAlpha
                     self.wattage += alpha * (rawSystem - self.wattage)
