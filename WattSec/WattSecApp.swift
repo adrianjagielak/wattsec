@@ -299,15 +299,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Display Updates
     
     private func updateWattageDisplay() {
-        let formatString = detailLevelFormatString()
+        let fmt = detailLevelFormatString()
         guard let button = statusItem?.button else { return }
-        
-        let wattage = PowerMonitor.shared.wattage
-        let wattageText = String(format: formatString, wattage)
+
+        let monitor = PowerMonitor.shared
+        let wattageText: String
+
+        if monitor.isCharging {
+            let consumption = String(format: fmt, monitor.wattage)
+            let netCharge = monitor.dcInWattage - monitor.wattage
+            let netText = String(format: fmt, abs(netCharge))
+            let sign = netCharge >= 0 ? "+" : "-"
+            wattageText = "\(consumption) \u{26A1}\(sign)\(netText)"
+        } else {
+            wattageText = "-" + String(format: fmt, monitor.wattage)
+        }
+
         button.title = wattageText
-        
+
         if widthMode == .fixed {
-            updateFixedWidth(for: wattageText, wattage: wattage)
+            updateFixedWidth(for: wattageText, wattage: monitor.wattage)
         }
     }
     
@@ -435,8 +446,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func bindToPowerMonitor() {
         wattageSubscription = PowerMonitor.shared.$wattage
+            .combineLatest(PowerMonitor.shared.$dcInWattage)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] _, _ in
                 self?.updateWattageDisplay()
             }
     }
@@ -514,8 +526,12 @@ class PowerMonitor: ObservableObject {
 
     static let shared = PowerMonitor()
 
-    /// Smoothed wattage value displayed in the menu bar
+    /// Smoothed system power consumption (PSTR)
     @Published var wattage: Double = 0.0
+    /// Smoothed DC input power (PDTR) — non-zero when charger connected
+    @Published var dcInWattage: Double = 0.0
+
+    var isCharging: Bool { dcInWattage > 1.0 }
 
     private var timer: AnyCancellable?
     private var smoothingAlpha: Double = PaceLevel.medium.smoothingAlpha
@@ -534,15 +550,18 @@ class PowerMonitor: ObservableObject {
 
     func fetchWattage() {
         DispatchQueue.global(qos: .background).async { [weak self] in
-            let rawValue = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
+            let rawSystem = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
+            let rawDcIn = max(0.0, SMC.shared.getValue("PDTR") ?? 0.0)
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if self.isFirstReading {
-                    self.wattage = rawValue
+                    self.wattage = rawSystem
+                    self.dcInWattage = rawDcIn
                     self.isFirstReading = false
                 } else {
-                    // Exponential moving average: smoothed = α * new + (1-α) * previous
-                    self.wattage += self.smoothingAlpha * (rawValue - self.wattage)
+                    let alpha = self.smoothingAlpha
+                    self.wattage += alpha * (rawSystem - self.wattage)
+                    self.dcInWattage += alpha * (rawDcIn - self.dcInWattage)
                 }
             }
         }
