@@ -528,9 +528,11 @@ class PowerMonitor: ObservableObject {
     
     func fetchWattage() {
         DispatchQueue.global(qos: .background).async { [weak self] in
-            let wattageValue = SMC.shared.getValue("PSTR") ?? 0.0
+            let systemPower = SMC.shared.getValue("PSTR") ?? 0.0
+            let displayPower = SMC.shared.getValue("PBLC") ?? 0.0
+            let totalPower = systemPower + displayPower
             DispatchQueue.main.async {
-                self?.wattage = wattageValue
+                self?.wattage = totalPower
             }
         }
     }

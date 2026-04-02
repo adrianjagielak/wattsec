@@ -157,6 +157,21 @@ public class SMC {
             return Float(val.bytes).map { Double($0) }
         }
 
+        // Fixed-point formats used by some power/sensor keys
+        if val.dataSize == 2 {
+            let raw = (UInt16(val.bytes[0]) << 8) | UInt16(val.bytes[1])
+            switch val.dataType {
+            case "sp78": // signed 7.8 fixed-point
+                return Double(Int16(bitPattern: raw)) / 256.0
+            case "fpe2": // unsigned 14.2 fixed-point
+                return Double(raw) / 4.0
+            case "fp88": // unsigned 8.8 fixed-point
+                return Double(raw) / 256.0
+            default:
+                break
+            }
+        }
+
         return nil
     }
     
