@@ -32,8 +32,17 @@ enum DetailLevel: Int, CaseIterable {
 
 enum PaceLevel: Int, CaseIterable {
     case fast = 1
-    case medium = 3
-    case slow = 5
+    case medium = 2
+    case slow = 3
+
+    /// EMA smoothing factor: higher = more responsive, lower = smoother
+    var smoothingAlpha: Double {
+        switch self {
+        case .fast: return 0.35
+        case .medium: return 0.2
+        case .slow: return 0.1
+        }
+    }
 }
 
 enum WidthMode: String, CaseIterable {
@@ -96,7 +105,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func loadUserPreferences() {
         let defaults = UserDefaults.standard
-        let currentVersion = 1
+        let currentVersion = 2
         let savedVersion = defaults.integer(forKey: "settingsVersion")
         
         if savedVersion < currentVersion {
@@ -195,21 +204,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     private func createPaceMenuItem() -> NSMenuItem {
-        let menuItem = NSMenuItem(title: "Pace", action: nil, keyEquivalent: "")
+        let menuItem = NSMenuItem(title: "Smoothing", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
-        
+
         for level in PaceLevel.allCases {
             let label = String(describing: level).capitalized
-            let item = createStyledMenuItem(
-                title: label,
-                suffix: "\(level.rawValue)s",
-                action: #selector(changePace),
-                value: level.rawValue,
-                isSelected: level == paceLevel
-            )
+            let item = NSMenuItem(title: label, action: #selector(changePace), keyEquivalent: "")
+            item.representedObject = level.rawValue
+            item.target = self
+            item.state = level == paceLevel ? .on : .off
             submenu.addItem(item)
         }
-        
+
         menuItem.submenu = submenu
         return menuItem
     }
@@ -429,7 +435,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func bindToPowerMonitor() {
         wattageSubscription = PowerMonitor.shared.$wattage
-            .debounce(for: .seconds(0.1), scheduler: DispatchQueue.main)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.updateWattageDisplay()
@@ -506,38 +511,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Power Monitor
 
 class PowerMonitor: ObservableObject {
-    
+
     static let shared = PowerMonitor()
-    
+
+    /// Smoothed wattage value displayed in the menu bar
     @Published var wattage: Double = 0.0
-    
+
     private var timer: AnyCancellable?
-    private var timerInterval: TimeInterval
-    
+    private var smoothingAlpha: Double = PaceLevel.medium.smoothingAlpha
+    private var isFirstReading = true
+
+    /// Fixed sample interval (200ms = 5 updates/sec)
+    private static let sampleInterval: TimeInterval = 0.2
+
     private init() {
-        timerInterval = Double(PaceLevel.medium.rawValue)
         setupTimer()
     }
-    
+
     func updatePace(_ pace: PaceLevel) {
-        let newInterval = Double(pace.rawValue)
-        guard newInterval != timerInterval else { return }
-        timerInterval = newInterval
-        setupTimer()
+        smoothingAlpha = pace.smoothingAlpha
     }
-    
+
     func fetchWattage() {
         DispatchQueue.global(qos: .background).async { [weak self] in
-            let wattageValue = SMC.shared.getValue("PSTR") ?? 0.0
+            let rawValue = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
             DispatchQueue.main.async {
-                self?.wattage = wattageValue
+                guard let self = self else { return }
+                if self.isFirstReading {
+                    self.wattage = rawValue
+                    self.isFirstReading = false
+                } else {
+                    // Exponential moving average: smoothed = α * new + (1-α) * previous
+                    self.wattage += self.smoothingAlpha * (rawValue - self.wattage)
+                }
             }
         }
     }
-    
+
     private func setupTimer() {
         timer?.cancel()
-        timer = Timer.publish(every: timerInterval, on: .main, in: .common)
+        timer = Timer.publish(every: Self.sampleInterval, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 self?.fetchWattage()
