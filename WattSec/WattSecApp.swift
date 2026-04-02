@@ -307,9 +307,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if monitor.isCharging {
             let dcIn = String(format: fmt, monitor.dcInWattage)
-            let consumption = String(format: fmt, monitor.wattage)
-            let net = String(format: fmt, monitor.dcInWattage - monitor.wattage)
-            wattageText = "\(dcIn) - \(consumption) = \(net)"
+            let netCharge = monitor.dcInWattage - monitor.wattage
+            let netText = String(format: fmt, abs(netCharge))
+            let sign = netCharge >= 0 ? "+" : "-"
+            wattageText = "\(dcIn) \u{26A1}\(sign)\(netText)"
         } else {
             wattageText = "-" + String(format: fmt, monitor.wattage)
         }
