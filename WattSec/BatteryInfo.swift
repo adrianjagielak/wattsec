@@ -9,9 +9,20 @@ import Foundation
 import IOKit
 
 /// Per-port USB-C power delivery measurement from PD controller hardware.
+///
+/// Source: "PowerOutDetails" array on AppleSmartBattery IORegistry entry.
+/// Each entry contains { PortIndex, PDPowermW, Watts, LocationID }.
+/// PDPowermW and Watts are both in milliwatts (Watts is misnamed).
+///
+/// Availability: NOT present on all Apple Silicon models/macOS versions.
+/// When absent, the property simply doesn't exist in the registry.
+/// macpow (k06a/macpow) and other tools also depend on this and
+/// silently return empty data when it's missing.
+/// No workaround is known; it appears to be firmware-dependent.
 struct UsbPortPower {
     let portIndex: Int       // 1-indexed port number
     let watts: Double        // Actual measured power delivery in watts
+    let locationID: UInt32   // USB location ID for device correlation
 }
 
 struct BatterySnapshot {
@@ -78,15 +89,32 @@ class BatteryInfo {
         let tte: Int = prop("AvgTimeToEmpty") ?? -1
         let ttf: Int = prop("AvgTimeToFull") ?? -1
 
-        // Per-port USB-C power delivery (actual measured milliwatts from PD controller)
+        // Per-port USB-C power delivery (actual measured milliwatts from PD controller).
+        // PowerOutDetails is an undocumented property that provides hardware-measured
+        // power delivery per USB-C port. It is NOT available on all Apple Silicon machines.
+        // When absent, the property simply doesn't exist (returns nil).
+        // macpow (k06a) uses the same approach with no fallback.
+        //
+        // Keys per entry:
+        //   "Watts" (int, milliwatts despite the name) -- preferred by macpow
+        //   "PDPowermW" (int, milliwatts) -- fallback
+        //   "PortIndex" (int) -- 1-indexed port number
+        //   "LocationID" (int) -- USB location ID for device correlation
         var usbPorts: [UsbPortPower] = []
         if let details: [[String: Any]] = prop("PowerOutDetails") {
             for entry in details {
                 let portIndex = entry["PortIndex"] as? Int ?? 0
-                // PDPowermW is milliwatts; fall back to Watts key (also mW despite the name)
-                let mw = entry["PDPowermW"] as? Int ?? entry["Watts"] as? Int ?? 0
+                let locationID = entry["LocationID"] as? Int ?? 0
+                // Watts key is preferred (same convention as macpow); PDPowermW as fallback
+                let wattsMw = entry["Watts"] as? Int ?? 0
+                let pdMw = entry["PDPowermW"] as? Int ?? 0
+                let mw = wattsMw > 0 ? wattsMw : pdMw
                 if mw > 0 {
-                    usbPorts.append(UsbPortPower(portIndex: portIndex, watts: Double(mw) / 1000.0))
+                    usbPorts.append(UsbPortPower(
+                        portIndex: portIndex,
+                        watts: Double(mw) / 1000.0,
+                        locationID: UInt32(locationID)
+                    ))
                 }
             }
         }

@@ -11,6 +11,33 @@
 //  Falls back to SMC-only breakdown if IOReport is unavailable.
 //  Screen power always comes from SMC (PDBR) since IOReport doesn't track it.
 //
+//  USB power measurement strategy (exhaustively researched, April 2026):
+//
+//  1. PRIMARY: PowerOutDetails from AppleSmartBattery IORegistry
+//     - Provides actual measured milliwatts per USB-C port (PDPowermW / Watts)
+//     - Hardware-level measurement from the USB-C PD controller
+//     - NOT available on all Apple Silicon MacBook Pro models/macOS versions
+//     - When missing, macpow (k06a) and other tools silently return empty data
+//     - No known workaround to force its presence; it appears firmware-dependent
+//
+//  2. FALLBACK: PSTR gap method (always available on Apple Silicon)
+//     - PSTR (SMC) = total system power at the main power rail (hardware sensor)
+//     - Subtract: IOReport Energy Model (CPU+GPU+ANE+DRAM+PCI+...) + PDBR (screen)
+//     - Residual ≈ USB/Thunderbolt power delivery + ~3-5% VRM losses
+//     - This IS a hardware measurement (difference of two hardware measurements)
+//     - Shows ~0W idle, ~5W for a charging phone, ~11W for an iPad, etc.
+//     - Limitation: total across all ports, not per-port
+//
+//  Ruled out (does not provide measured USB power delivery on Apple Silicon):
+//  - SMC keys D0IR/D0VR: measure AC power IN (charger), not OUT to devices
+//  - SMC key PUSB: intermittent/unreliable on many machines
+//  - USB descriptor bMaxPower / UsbPowerSinkAllocation: max requested, not actual
+//  - IOReport Energy Model "PCI" channel: controller's own power, not throughput
+//  - powermetrics: no USB sampler exists
+//  - IOPSCopyExternalPowerAdapterDetails: adapter info only (power IN)
+//  - system_profiler SPUSBDataType: descriptor max values, not measured
+//  - PowerTelemetryData, PowerLog DB: no per-port USB power data
+//
 //  This class is UI-independent and can be reused in any macOS app.
 //
 
@@ -31,6 +58,10 @@ class PowerMonitor: ObservableObject {
     @Published var battery: BatterySnapshot?
     /// Smoothed power breakdown by component
     @Published var powerBreakdown: [PowerComponent] = []
+    /// Per-port USB-C power delivery (from PowerOutDetails when available)
+    @Published var usbPortPower: [UsbPortPower] = []
+    /// Whether per-port USB power data is available (vs PSTR-gap fallback)
+    var hasPerPortUsbPower: Bool { !usbPortPower.isEmpty }
 
     // MARK: - Computed Properties
 
@@ -167,9 +198,10 @@ class PowerMonitor: ObservableObject {
         // Build component breakdown
         powerBreakdown = buildBreakdown(rawScreen: rawScreen)
 
-        // Update battery snapshot
+        // Update battery snapshot and per-port USB power
         if let snap = batterySnap {
             battery = snap
+            usbPortPower = snap.usbPortPower
         }
         batteryReadCounter = (batteryReadCounter + 1) % Self.batteryReadInterval
         ioReportReadCounter = (ioReportReadCounter + 1) % Self.ioReportReadInterval
@@ -195,13 +227,30 @@ class PowerMonitor: ObservableObject {
         // Screen power from PDBR (included in PSTR)
         components.append(smoothedComponent("Screen", raw: rawScreen))
 
-        // Unmetered power = PSTR - IOReport - Screen.
-        // This is primarily USB/Thunderbolt device power delivery
-        // (plus small VRM losses). Shows ~0W with nothing plugged in,
-        // jumps to ~11W when charging an iPhone, etc.
+        // USB/External power: prefer per-port hardware measurement,
+        // fall back to PSTR-gap calculation.
+        //
+        // PowerOutDetails (when available) gives actual measured milliwatts
+        // per USB-C port from the PD controller hardware. When unavailable,
+        // the PSTR gap (total system minus metered SoC minus screen) captures
+        // the same power — it's a hardware measurement too, just aggregated.
         let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
-        let unmetered = max(0, wattage - meteredTotal)
-        components.append(smoothedComponent("USB/Ext", raw: unmetered))
+        if !usbPortPower.isEmpty {
+            // Per-port data available from PowerOutDetails
+            for port in usbPortPower {
+                components.append(smoothedComponent("USB Port \(port.portIndex)", raw: port.watts))
+            }
+            // Still show residual for anything not captured by PD (e.g. VRM losses)
+            let pdTotal = usbPortPower.reduce(0.0) { $0 + $1.watts }
+            let residual = max(0, wattage - meteredTotal - pdTotal)
+            if residual > 0.1 {
+                components.append(smoothedComponent("Other", raw: residual))
+            }
+        } else {
+            // Fallback: PSTR gap method — all external power lumped together
+            let unmetered = max(0, wattage - meteredTotal)
+            components.append(smoothedComponent("USB/Ext", raw: unmetered))
+        }
 
         return components
     }
