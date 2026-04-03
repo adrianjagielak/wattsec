@@ -383,10 +383,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func timeToLowBattery(monitor: PowerMonitor) -> String {
-        guard let bat = monitor.battery else { return "--:--" }
+        guard let bat = monitor.battery else { return "0:00" }
 
         let avgPower = monitor.averageWattage
-        guard avgPower > 0.5 else { return "--:--" }
+        guard avgPower > 0.5 else { return "0:00" }
 
         // Remaining Wh until 10% SoC
         let targetWh = bat.maxCapacityWh * 0.10
