@@ -74,6 +74,8 @@ class PowerMonitor: ObservableObject {
 
     /// Last IOReport breakdown (updated every ~1s, displayed every 200ms)
     private var lastIOReportBreakdown: IOReportPowerBreakdown?
+    /// Last USB power reading in watts
+    private var lastUsbPowerWatts: Double = 0
 
     // MARK: - Init
 
@@ -103,6 +105,9 @@ class PowerMonitor: ObservableObject {
             // Screen power from SMC (IOReport doesn't track display)
             let rawScreen = max(0.0, SMC.shared.getValue("PDBR") ?? 0.0)
 
+            // USB total power from SMC (fallback if PowerOutDetails unavailable)
+            let rawUsbSmc = max(0.0, SMC.shared.getValue("PUSB") ?? 0.0)
+
             // Read battery less frequently (it changes slowly)
             var snap: BatterySnapshot? = nil
             if self.batteryReadCounter == 0 {
@@ -120,6 +125,7 @@ class PowerMonitor: ObservableObject {
                     rawSystem: rawSystem,
                     rawDcIn: rawDcIn,
                     rawScreen: rawScreen,
+                    rawUsbSmc: rawUsbSmc,
                     batterySnap: snap,
                     ioBreakdown: ioBreakdown
                 )
@@ -133,6 +139,7 @@ class PowerMonitor: ObservableObject {
         rawSystem: Double,
         rawDcIn: Double,
         rawScreen: Double,
+        rawUsbSmc: Double,
         batterySnap: BatterySnapshot?,
         ioBreakdown: IOReportPowerBreakdown?
     ) {
@@ -163,6 +170,16 @@ class PowerMonitor: ObservableObject {
             lastIOReportBreakdown = io
         }
 
+        // Update USB power: prefer PowerOutDetails, fall back to SMC PUSB
+        if let snap = batterySnap, snap.totalUsbPowerWatts > 0.01 {
+            lastUsbPowerWatts = snap.totalUsbPowerWatts
+        } else if rawUsbSmc > 0.01 {
+            lastUsbPowerWatts = rawUsbSmc
+        } else if batterySnap != nil {
+            // Battery was read but no USB power — update to 0
+            lastUsbPowerWatts = 0
+        }
+
         // Build component breakdown
         powerBreakdown = buildBreakdown(rawScreen: rawScreen)
 
@@ -181,16 +198,12 @@ class PowerMonitor: ObservableObject {
             // Primary IOReport components
             components.append(smoothedComponent("CPU", raw: io.cpuWatts))
             components.append(smoothedComponent("GPU", raw: io.gpuTotalWatts))
-            if io.aneWatts > 0.01 {
-                components.append(smoothedComponent("ANE", raw: io.aneWatts))
-            }
+            components.append(smoothedComponent("ANE", raw: io.aneWatts))
             components.append(smoothedComponent("DRAM", raw: io.dramWatts))
 
             // Additional IOReport components (media engines, PCI, etc.)
             for comp in io.otherComponents {
-                if comp.watts > 0.05 {
-                    components.append(smoothedComponent(comp.label, raw: comp.watts))
-                }
+                components.append(smoothedComponent(comp.label, raw: comp.watts))
             }
         }
 
@@ -199,10 +212,9 @@ class PowerMonitor: ObservableObject {
 
         // USB power delivery from AppleSmartBattery PowerOutDetails
         // (actual measured milliwatts from USB-C PD controller hardware)
-        let usbWatts = battery?.totalUsbPowerWatts ?? 0
-        if usbWatts > 0.1 {
-            components.append(smoothedComponent("USB", raw: usbWatts))
-        }
+        // Falls back to SMC key PUSB (read in fetchWattage)
+        let usbWatts = lastUsbPowerWatts
+        components.append(smoothedComponent("USB", raw: usbWatts))
 
         // "Other" = System total minus sum of all metered components
         // Includes: USB power delivery, VRM losses, SoC fabric, unmeasured subsystems
