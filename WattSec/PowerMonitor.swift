@@ -176,6 +176,7 @@ class PowerMonitor: ObservableObject {
 
     private func buildBreakdown(rawScreen: Double) -> [PowerComponent] {
         var components: [PowerComponent] = []
+        var meteredTotal: Double = 0
 
         if let io = lastIOReportBreakdown {
             // IOReport components with smoothing
@@ -189,6 +190,13 @@ class PowerMonitor: ObservableObject {
 
         // Screen power always from SMC
         components.append(smoothedComponent("Screen", raw: rawScreen))
+
+        // Calculate "Other" = System total minus sum of metered components
+        meteredTotal = components.reduce(0) { $0 + $1.watts }
+        let other = max(0, wattage - meteredTotal)
+        if other > 0.1 {
+            components.append(smoothedComponent("Other", raw: other))
+        }
 
         return components
     }
