@@ -178,7 +178,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         if let button = statusItem.button {
-            button.font = NSFont.monospacedDigitSystemFont(ofSize: 0, weight: .regular)
             button.action = #selector(showMenu)
             button.target = self
         }
@@ -360,7 +359,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             wattageText = "-\(consumption)  \(soc)%"
         }
 
-        button.title = wattageText
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        button.attributedTitle = NSAttributedString(string: wattageText, attributes: [.font: font])
 
         if widthMode == .fixed {
             updateFixedWidth(for: wattageText, wattage: monitor.wattage)
