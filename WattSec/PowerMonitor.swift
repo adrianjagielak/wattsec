@@ -303,17 +303,15 @@ class PowerMonitor: ObservableObject {
         let runLoopSource = IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue()
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
 
-        let matching = IOServiceMatching("IOUSBHostDevice")
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         // Device added
-        if let matchCopy = matching?.mutableCopy() as? NSMutableDictionary {
-            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        if let matching = IOServiceMatching("IOUSBHostDevice") {
             IOServiceAddMatchingNotification(
                 notifyPort,
                 kIOFirstMatchNotification,
-                matchCopy,
+                matching,
                 { refcon, iterator in
-                    // Drain the iterator (required) and notify
                     while IOIteratorNext(iterator) != 0 {}
                     guard let refcon = refcon else { return }
                     let monitor = Unmanaged<PowerMonitor>.fromOpaque(refcon).takeUnretainedValue()
@@ -322,17 +320,15 @@ class PowerMonitor: ObservableObject {
                 selfPtr,
                 &usbAddedIterator
             )
-            // Drain initial iterator
             while IOIteratorNext(usbAddedIterator) != 0 {}
         }
 
-        // Device removed
-        if let matchCopy = matching?.mutableCopy() as? NSMutableDictionary {
-            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        // Device removed (needs its own matching dict — IOKit consumes one per call)
+        if let matching = IOServiceMatching("IOUSBHostDevice") {
             IOServiceAddMatchingNotification(
                 notifyPort,
                 kIOTerminatedNotification,
-                matchCopy,
+                matching,
                 { refcon, iterator in
                     while IOIteratorNext(iterator) != 0 {}
                     guard let refcon = refcon else { return }
