@@ -89,9 +89,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var batteryTimeItem: NSMenuItem?
     private var batteryCyclesItem: NSMenuItem?
     private var batteryTempItem: NSMenuItem?
-    private var powerSeparatorItem: NSMenuItem?
-    private var powerSectionStartIndex: Int = 0
-    private var powerMenuItems: [NSMenuItem] = []
+    // Power section items (pre-created, titles updated)
+    private var powerSystemItem: NSMenuItem?
+    private var powerDcInItem: NSMenuItem?
+    private var powerNetItem: NSMenuItem?
+    private var powerBreakdownItems: [NSMenuItem] = []
+    private static let maxBreakdownItems = 8
     
     // MARK: Application Lifecycle
     
@@ -201,10 +204,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         batteryTempItem?.isEnabled = false
         menu.addItem(batteryTempItem!)
 
-        // Power section separator
-        powerSeparatorItem = NSMenuItem.separator()
-        menu.addItem(powerSeparatorItem!)
-        powerSectionStartIndex = menu.items.count
+        menu.addItem(NSMenuItem.separator())
+
+        // Power section (pre-created, updated dynamically)
+        powerSystemItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        powerSystemItem?.isEnabled = false
+        menu.addItem(powerSystemItem!)
+
+        powerDcInItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        powerDcInItem?.isEnabled = false
+        powerDcInItem?.isHidden = true
+        menu.addItem(powerDcInItem!)
+
+        powerNetItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        powerNetItem?.isEnabled = false
+        powerNetItem?.isHidden = true
+        menu.addItem(powerNetItem!)
+
+        // Pre-create breakdown item slots
+        for _ in 0..<Self.maxBreakdownItems {
+            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            item.isHidden = true
+            menu.addItem(item)
+            powerBreakdownItems.append(item)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -416,41 +440,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             batteryTempItem?.title = String(format: "Temp    %.1f\u{00B0}C", bat.temperatureC)
         }
 
-        // Power breakdown section — rebuild dynamically
-        guard let menu = statusItem?.menu else { return }
+        // Power section — update titles only, never add/remove items
         let fmt = detailLevelFormatString()
+        powerSystemItem?.title = "System    " + String(format: fmt, monitor.wattage)
 
-        // Remove old power items
-        for item in powerMenuItems {
-            menu.removeItem(item)
-        }
-        powerMenuItems.removeAll()
-
-        var insertIndex = powerSectionStartIndex
-
-        func addPowerItem(_ title: String) {
-            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.insertItem(item, at: insertIndex)
-            powerMenuItems.append(item)
-            insertIndex += 1
-        }
-
-        // System total
-        addPowerItem("System    " + String(format: fmt, monitor.wattage))
-
-        // Charging info
         if monitor.isCharging {
-            addPowerItem("DC In    " + String(format: fmt, monitor.dcInWattage))
+            powerDcInItem?.title = "DC In    " + String(format: fmt, monitor.dcInWattage)
+            powerDcInItem?.isHidden = false
             let net = monitor.dcInWattage - monitor.wattage
-            addPowerItem("To Battery    " + String(format: fmt, net))
+            powerNetItem?.title = "To Battery    " + String(format: fmt, net)
+            powerNetItem?.isHidden = false
+        } else {
+            powerDcInItem?.isHidden = true
+            powerNetItem?.isHidden = true
         }
 
-        // Component breakdown
-        if !monitor.powerBreakdown.isEmpty {
-            addPowerItem("") // blank spacer
-            for component in monitor.powerBreakdown {
-                addPowerItem("  \(component.label)    " + String(format: fmt, component.watts))
+        // Component breakdown — fill pre-created slots
+        let breakdown = monitor.powerBreakdown
+        for (i, item) in powerBreakdownItems.enumerated() {
+            if i < breakdown.count {
+                item.title = "  \(breakdown[i].label)    " + String(format: fmt, breakdown[i].watts)
+                item.isHidden = false
+            } else {
+                item.isHidden = true
             }
         }
     }
@@ -702,7 +714,6 @@ class PowerMonitor: ObservableObject {
         ("ANE", "PANT"),         // Apple Neural Engine
         ("DRAM", "PDMR"),        // DRAM power
         ("Screen", "PDBR"),      // Display Brightness
-        ("Heatpipe", "PHPC"),    // Heatpipe (SoC thermal)
     ]
 
     /// Tracks which keys actually exist on this machine (discovered on first read)
