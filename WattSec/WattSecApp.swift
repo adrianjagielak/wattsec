@@ -365,11 +365,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             let attributed = NSMutableAttributedString(string: text, attributes: defaultAttrs)
 
-            // Color the time portion based on SoC
+            // Color the time portion: red at ≤10%, orange when Low Power Mode is on
             let timeRange = NSRange(location: 0, length: timeStr.count)
             if soc <= 10 {
                 attributed.addAttribute(.foregroundColor, value: NSColor.systemRed, range: timeRange)
-            } else if soc <= 20 {
+            } else if ProcessInfo.processInfo.isLowPowerModeEnabled {
                 attributed.addAttribute(.foregroundColor, value: NSColor.systemOrange, range: timeRange)
             }
 
@@ -383,10 +383,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func timeToLowBattery(monitor: PowerMonitor) -> String {
-        guard let bat = monitor.battery else { return "0:00" }
+        guard let bat = monitor.battery else { return "--:--" }
 
         let avgPower = monitor.averageWattage
-        guard avgPower > 0.5 else { return "0:00" }
+        guard avgPower > 0.5 else { return "--:--" }
 
         // Remaining Wh until 10% SoC
         let targetWh = bat.maxCapacityWh * 0.10
