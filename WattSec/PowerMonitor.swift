@@ -195,12 +195,13 @@ class PowerMonitor: ObservableObject {
         // Screen power from PDBR (included in PSTR)
         components.append(smoothedComponent("Screen", raw: rawScreen))
 
-        // "Other" = PSTR minus all metered components.
-        // Absorbs: USB power delivery, VRM losses, fabric, IOReport measurement drift.
-        // When you plug in a device, this is where the charging power shows up.
+        // Unmetered power = PSTR - IOReport - Screen.
+        // This is primarily USB/Thunderbolt device power delivery
+        // (plus small VRM losses). Shows ~0W with nothing plugged in,
+        // jumps to ~11W when charging an iPhone, etc.
         let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
-        let other = max(0, wattage - meteredTotal)
-        components.append(smoothedComponent("Other", raw: other))
+        let unmetered = max(0, wattage - meteredTotal)
+        components.append(smoothedComponent("USB/Ext", raw: unmetered))
 
         return components
     }
