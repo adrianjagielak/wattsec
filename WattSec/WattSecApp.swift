@@ -135,7 +135,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // We'll set launchAtLogin in checkLaunchAtLoginStatus() instead
         
-        PowerMonitor.shared.updatePace(paceLevel)
+        PowerMonitor.shared.updatePace(paceLevel.smoothingAlpha)
     }
     
     // MARK: Widest Width Calculation
@@ -327,7 +327,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         paceLevel = newPace
         UserDefaults.standard.set(rawValue, forKey: "paceLevel")
-        PowerMonitor.shared.updatePace(newPace)
+        PowerMonitor.shared.updatePace(newPace.smoothingAlpha)
         updateMenuStates(sender.menu, selectedValue: rawValue)
     }
     
@@ -663,158 +663,5 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Reset the state to match the actual system state
             checkLaunchAtLoginStatus()
         }
-    }
-}
-
-// MARK: - Power Monitor
-
-class PowerMonitor: ObservableObject {
-
-    static let shared = PowerMonitor()
-
-    /// Smoothed system power consumption (PSTR)
-    @Published var wattage: Double = 0.0
-    /// Smoothed DC input power (PDTR) — non-zero when charger connected
-    @Published var dcInWattage: Double = 0.0
-    /// Latest battery snapshot (updated every ~2 seconds)
-    @Published var battery: BatterySnapshot?
-    /// Smoothed power breakdown by component
-    @Published var powerBreakdown: [(label: String, watts: Double)] = []
-
-    var isCharging: Bool { dcInWattage > Self.chargingThreshold }
-
-    /// 5-minute rolling average of system power (for time estimates)
-    var averageWattage: Double {
-        guard !wattageHistory.isEmpty else { return wattage }
-        return wattageHistory.reduce(0, +) / Double(wattageHistory.count)
-    }
-
-    private var timer: AnyCancellable?
-    private var smoothingAlpha: Double = PaceLevel.medium.smoothingAlpha
-    private var isFirstReading = true
-    private var wasCharging = false
-    private var batteryReadCounter = 0
-    private var wattageHistory: [Double] = []
-
-    /// Fixed sample interval (200ms = 5 updates/sec)
-    private static let sampleInterval: TimeInterval = 0.2
-    /// Threshold for detecting charger connected
-    private static let chargingThreshold: Double = 1.0
-    /// Read battery info every N samples (~2 seconds at 200ms)
-    private static let batteryReadInterval = 10
-    /// 5 minutes of samples at 200ms = 1500 entries
-    private static let historySize = 1500
-
-    /// SMC keys to try for power breakdown (label, key)
-    /// Keys that return nil on a given machine are auto-discovered and skipped
-    private static let breakdownKeys: [(label: String, key: String)] = [
-        ("CPU", "PCPT"),         // CPU Package Total
-        ("CPU", "PCTR"),         // CPU Total Rail (fallback)
-        ("GPU", "PGTR"),         // GPU Total Rail
-        ("ANE", "PANT"),         // Apple Neural Engine
-        ("DRAM", "PDMR"),        // DRAM power
-        ("Screen", "PDBR"),      // Display Brightness
-    ]
-
-    /// Tracks which keys actually exist on this machine (discovered on first read)
-    private var availableBreakdownKeys: [(label: String, key: String)]?
-    /// Smoothed values for each breakdown key
-    private var breakdownSmoothed: [String: Double] = [:]
-
-    private init() {
-        setupTimer()
-    }
-
-    func updatePace(_ pace: PaceLevel) {
-        smoothingAlpha = pace.smoothingAlpha
-    }
-
-    func fetchWattage() {
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            let rawSystem = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
-            let rawDcIn = max(0.0, SMC.shared.getValue("PDTR") ?? 0.0)
-
-            // Read battery less frequently (it changes slowly)
-            var snap: BatterySnapshot? = nil
-            if let self = self {
-                let counter = self.batteryReadCounter
-                if counter == 0 {
-                    snap = BatteryInfo.shared.snapshot()
-                }
-            }
-
-            // Read power breakdown keys
-            let keysToRead: [(label: String, key: String)]
-            if let available = self?.availableBreakdownKeys {
-                keysToRead = available
-            } else {
-                keysToRead = Self.breakdownKeys
-            }
-
-            var rawBreakdown: [(label: String, key: String, value: Double)] = []
-            var seenLabels = Set<String>()
-            for (label, key) in keysToRead {
-                // Skip duplicate labels (e.g., CPU has two fallback keys)
-                guard !seenLabels.contains(label) else { continue }
-                if let val = SMC.shared.getValue(key) {
-                    rawBreakdown.append((label: label, key: key, value: max(0.0, val)))
-                    seenLabels.insert(label)
-                }
-            }
-
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                let nowCharging = rawDcIn > Self.chargingThreshold
-
-                // Reset smoothing on charger connect/disconnect
-                if self.isFirstReading || nowCharging != self.wasCharging {
-                    self.wattage = rawSystem
-                    self.dcInWattage = rawDcIn
-                    self.isFirstReading = false
-                    self.wasCharging = nowCharging
-                    self.wattageHistory.removeAll()
-                    self.breakdownSmoothed.removeAll()
-                } else {
-                    let alpha = self.smoothingAlpha
-                    self.wattage += alpha * (rawSystem - self.wattage)
-                    self.dcInWattage += alpha * (rawDcIn - self.dcInWattage)
-                }
-
-                // Track rolling 5-minute history for time estimates
-                self.wattageHistory.append(rawSystem)
-                if self.wattageHistory.count > Self.historySize {
-                    self.wattageHistory.removeFirst()
-                }
-
-                // Update breakdown with smoothing
-                if self.availableBreakdownKeys == nil && !rawBreakdown.isEmpty {
-                    // Lock in discovered keys after first successful read
-                    self.availableBreakdownKeys = rawBreakdown.map { ($0.label, $0.key) }
-                }
-
-                var breakdown: [(label: String, watts: Double)] = []
-                for item in rawBreakdown {
-                    let prev = self.breakdownSmoothed[item.key] ?? item.value
-                    let smoothed = prev + self.smoothingAlpha * (item.value - prev)
-                    self.breakdownSmoothed[item.key] = smoothed
-                    breakdown.append((label: item.label, watts: smoothed))
-                }
-                self.powerBreakdown = breakdown
-
-                if snap != nil {
-                    self.battery = snap
-                }
-                self.batteryReadCounter = (self.batteryReadCounter + 1) % Self.batteryReadInterval
-            }
-        }
-    }
-
-    private func setupTimer() {
-        timer?.cancel()
-        timer = Timer.publish(every: Self.sampleInterval, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                self?.fetchWattage()
-            }
     }
 }
