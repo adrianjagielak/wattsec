@@ -420,7 +420,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Battery section
         if let bat = bat {
-            batteryCapacityItem?.title = String(format: "Capacity    %.1f / %.1f Wh", bat.currentCapacityWh, bat.maxCapacityWh)
+            // Use interpolated Wh (sub-percent granularity, stable voltage)
+            if let cap = monitor.interpolatedCapacity() {
+                batteryCapacityItem?.title = String(format: "Capacity    %.1f / %.1f Wh", cap.currentWh, cap.maxWh)
+            }
 
             if monitor.isCharging {
                 if bat.timeToFull > 0 {

@@ -43,6 +43,7 @@
 
 import Combine
 import Foundation
+import IOKit
 
 class PowerMonitor: ObservableObject {
 
@@ -106,6 +107,18 @@ class PowerMonitor: ObservableObject {
     /// Last IOReport breakdown (updated every ~1s, displayed every 200ms)
     private var lastIOReportBreakdown: IOReportPowerBreakdown?
 
+    /// USB device notification port and iterators
+    private var usbNotifyPort: IONotificationPortRef?
+    private var usbAddedIterator: io_iterator_t = 0
+    private var usbRemovedIterator: io_iterator_t = 0
+
+    /// Interpolated battery capacity
+    private var lastSnapSocPercent: Int = -1
+    private var lastSnapWh: Double = 0
+    private var lastSnapMaxWh: Double = 0
+    private var lastSnapTime: Date?
+    private var nominalVoltage: Double = 0
+
     // MARK: - Init
 
     private init() {
@@ -115,6 +128,7 @@ class PowerMonitor: ObservableObject {
             print("PowerMonitor: IOReport unavailable — using SMC-only breakdown")
         }
         setupTimer()
+        setupUsbNotifications()
     }
 
     // MARK: - Public API
@@ -124,7 +138,7 @@ class PowerMonitor: ObservableObject {
     }
 
     func fetchWattage() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
 
             // Read primary power values from SMC
@@ -278,6 +292,111 @@ class PowerMonitor: ObservableObject {
             .sink { [weak self] _ in
                 self?.fetchWattage()
             }
+    }
+
+    // MARK: - Private: USB Device Notifications
+
+    private func setupUsbNotifications() {
+        usbNotifyPort = IONotificationPortCreate(kIOMainPortDefault)
+        guard let notifyPort = usbNotifyPort else { return }
+
+        let runLoopSource = IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue()
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
+
+        let matching = IOServiceMatching("IOUSBHostDevice")
+
+        // Device added
+        if let matchCopy = matching?.mutableCopy() as? NSMutableDictionary {
+            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+            IOServiceAddMatchingNotification(
+                notifyPort,
+                kIOFirstMatchNotification,
+                matchCopy,
+                { refcon, iterator in
+                    // Drain the iterator (required) and notify
+                    while IOIteratorNext(iterator) != 0 {}
+                    guard let refcon = refcon else { return }
+                    let monitor = Unmanaged<PowerMonitor>.fromOpaque(refcon).takeUnretainedValue()
+                    DispatchQueue.main.async { monitor.onUsbDeviceChanged() }
+                },
+                selfPtr,
+                &usbAddedIterator
+            )
+            // Drain initial iterator
+            while IOIteratorNext(usbAddedIterator) != 0 {}
+        }
+
+        // Device removed
+        if let matchCopy = matching?.mutableCopy() as? NSMutableDictionary {
+            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+            IOServiceAddMatchingNotification(
+                notifyPort,
+                kIOTerminatedNotification,
+                matchCopy,
+                { refcon, iterator in
+                    while IOIteratorNext(iterator) != 0 {}
+                    guard let refcon = refcon else { return }
+                    let monitor = Unmanaged<PowerMonitor>.fromOpaque(refcon).takeUnretainedValue()
+                    DispatchQueue.main.async { monitor.onUsbDeviceChanged() }
+                },
+                selfPtr,
+                &usbRemovedIterator
+            )
+            while IOIteratorNext(usbRemovedIterator) != 0 {}
+        }
+    }
+
+    private func onUsbDeviceChanged() {
+        // Reset USB/Ext smoothing so it converges fast on the new value
+        componentSmoothed.removeValue(forKey: "USB/Ext")
+    }
+
+    // MARK: - Private: Interpolated Battery
+
+    /// Update interpolated battery Wh using measured power draw.
+    /// Snaps to real IORegistry values when SoC% changes, interpolates between.
+    func interpolatedCapacity() -> (currentWh: Double, maxWh: Double)? {
+        guard let bat = battery else { return nil }
+
+        // Use nominal voltage (running average) for stable Wh conversion
+        if nominalVoltage == 0 {
+            nominalVoltage = Double(bat.voltageMV)
+        } else {
+            // Slow-track voltage to filter load-dependent fluctuations
+            nominalVoltage += 0.01 * (Double(bat.voltageMV) - nominalVoltage)
+        }
+
+        let stableMaxWh = Double(bat.maxCapacityMAh) * nominalVoltage / 1_000_000.0
+        let stableCurrentWh = Double(bat.currentCapacityMAh) * nominalVoltage / 1_000_000.0
+
+        // Snap when SoC% changes (new real data from IORegistry)
+        if bat.socPercent != lastSnapSocPercent {
+            lastSnapSocPercent = bat.socPercent
+            lastSnapWh = stableCurrentWh
+            lastSnapMaxWh = stableMaxWh
+            lastSnapTime = Date()
+            return (stableCurrentWh, stableMaxWh)
+        }
+
+        // Between % changes: interpolate using measured power draw
+        guard let snapTime = lastSnapTime else {
+            return (stableCurrentWh, stableMaxWh)
+        }
+
+        let elapsed = Date().timeIntervalSince(snapTime) / 3600.0 // hours
+        let energyUsed = averageWattage * elapsed  // Wh consumed since snap
+
+        // Subtract if discharging, add if charging
+        let interpolated: Double
+        if isCharging {
+            let netChargeRate = dcInWattage - wattage
+            let energyAdded = max(0, netChargeRate) * elapsed
+            interpolated = min(lastSnapWh + energyAdded, lastSnapMaxWh)
+        } else {
+            interpolated = max(0, lastSnapWh - energyUsed)
+        }
+
+        return (interpolated, lastSnapMaxWh)
     }
 }
 
