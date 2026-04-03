@@ -32,12 +32,18 @@ struct IOReportPowerBreakdown {
     var aneWatts: Double = 0
     /// DRAM (off-chip memory)
     var dramWatts: Double = 0
+    /// Media engines, ISP, PCI, memory controllers, etc.
+    /// Each entry: (human-readable label, watts)
+    var otherComponents: [(label: String, watts: Double)] = []
 
     /// True GPU subsystem power: compute + SRAM
     var gpuTotalWatts: Double { gpuComputeWatts + gpuSRAMWatts }
 
     /// Sum of all metered components
-    var packageWatts: Double { cpuWatts + gpuComputeWatts + gpuSRAMWatts + aneWatts + dramWatts }
+    var totalMeteredWatts: Double {
+        cpuWatts + gpuComputeWatts + gpuSRAMWatts + aneWatts + dramWatts
+        + otherComponents.reduce(0) { $0 + $1.watts }
+    }
 }
 
 // MARK: - IOReport Reader
@@ -252,6 +258,36 @@ final class IOReportReader {
         // DRAM
         else if name.hasPrefix("DRAM") {
             result.dramWatts += watts
+        }
+        // Everything else — capture if non-trivial
+        else if watts > 0.001 {
+            let label = humanLabel(for: name)
+            // Merge into existing label if present (e.g. multiple DCS channels)
+            if let idx = result.otherComponents.firstIndex(where: { $0.label == label }) {
+                result.otherComponents[idx].watts += watts
+            } else {
+                result.otherComponents.append((label: label, watts: watts))
+            }
+        }
+    }
+
+    /// Convert raw IOReport channel names to human-readable labels.
+    private func humanLabel(for channelName: String) -> String {
+        // Strip die prefixes (Ultra chips): "DIE_0_" / "DIE_1_"
+        var name = channelName
+        if let range = name.range(of: #"^DIE_\d+_"#, options: .regularExpression) {
+            name = String(name[range.upperBound...])
+        }
+        // Strip trailing digits: "DCS0" -> "DCS", "AMCC0" -> "AMCC"
+        let stripped = name.replacingOccurrences(of: #"\d+$"#, with: "", options: .regularExpression)
+
+        switch stripped {
+        case "DCS", "AMCC":  return "Memory Ctrl"
+        case "ISP":          return "ISP"
+        case "AVE":          return "Video Enc"
+        case "MSR":          return "Scaler"
+        case "PCI":          return "PCI"
+        default:             return stripped.isEmpty ? name : stripped
         }
     }
 

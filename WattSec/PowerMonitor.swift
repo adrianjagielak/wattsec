@@ -176,23 +176,30 @@ class PowerMonitor: ObservableObject {
 
     private func buildBreakdown(rawScreen: Double) -> [PowerComponent] {
         var components: [PowerComponent] = []
-        var meteredTotal: Double = 0
 
         if let io = lastIOReportBreakdown {
-            // IOReport components with smoothing
+            // Primary IOReport components
             components.append(smoothedComponent("CPU", raw: io.cpuWatts))
             components.append(smoothedComponent("GPU", raw: io.gpuTotalWatts))
             if io.aneWatts > 0.01 {
                 components.append(smoothedComponent("ANE", raw: io.aneWatts))
             }
             components.append(smoothedComponent("DRAM", raw: io.dramWatts))
+
+            // Additional IOReport components (media engines, PCI, etc.)
+            for comp in io.otherComponents {
+                if comp.watts > 0.05 {
+                    components.append(smoothedComponent(comp.label, raw: comp.watts))
+                }
+            }
         }
 
-        // Screen power always from SMC
+        // Screen power from SMC (IOReport doesn't track display)
         components.append(smoothedComponent("Screen", raw: rawScreen))
 
-        // Calculate "Other" = System total minus sum of metered components
-        meteredTotal = components.reduce(0) { $0 + $1.watts }
+        // "Other" = System total minus sum of all metered components
+        // Includes: USB power delivery, VRM losses, SoC fabric, unmeasured subsystems
+        let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
         let other = max(0, wattage - meteredTotal)
         if other > 0.1 {
             components.append(smoothedComponent("Other", raw: other))
