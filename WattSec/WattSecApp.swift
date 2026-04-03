@@ -178,6 +178,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         if let button = statusItem.button {
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: 0, weight: .regular)
             button.action = #selector(showMenu)
             button.target = self
         }
@@ -354,9 +355,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let consumption = String(format: fmt, monitor.wattage)
         if monitor.isCharging {
             let dcIn = String(format: fmt, monitor.dcInWattage)
-            wattageText = "\u{26A1}\(dcIn) -\(consumption) \(soc)%"
+            wattageText = "\u{26A1}\(dcIn)  -\(consumption)  \(soc)%"
         } else {
-            wattageText = "-\(consumption) \(soc)%"
+            wattageText = "-\(consumption)  \(soc)%"
         }
 
         button.title = wattageText
