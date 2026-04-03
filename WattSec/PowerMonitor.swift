@@ -117,7 +117,11 @@ class PowerMonitor: ObservableObject {
     private var lastSnapMaxWh: Double = 0
     private var interpolatedWh: Double = 0
     private var lastInterpolationTime: Date?
-    private var nominalVoltage: Double = 0
+
+    /// Fixed nominal voltage for mAh→Wh conversion.
+    /// Apple Silicon MacBooks all use 3-cell LiPo (3 × 3.85V = 11.55V nominal).
+    /// This matches Apple's published Wh specs across all models (Air, Pro 14", Pro 16").
+    private static let nominalVoltage: Double = 11_550.0 // mV
 
     // MARK: - Init
 
@@ -354,14 +358,7 @@ class PowerMonitor: ObservableObject {
     func interpolatedCapacity() -> (currentWh: Double, maxWh: Double)? {
         guard let bat = battery else { return nil }
 
-        // Use nominal voltage (running average) for stable Wh conversion
-        if nominalVoltage == 0 {
-            nominalVoltage = Double(bat.voltageMV)
-        } else {
-            nominalVoltage += 0.01 * (Double(bat.voltageMV) - nominalVoltage)
-        }
-
-        let stableMaxWh = Double(bat.maxCapacityMAh) * nominalVoltage / 1_000_000.0
+        let stableMaxWh = Double(bat.maxCapacityMAh) * Self.nominalVoltage / 1_000_000.0
         // Derive currentWh from macOS SoC% so they're always consistent.
         // AppleRawCurrentCapacity/AppleRawMaxCapacity doesn't match CurrentCapacity%
         // because Apple uses non-linear curves, temp compensation, and calibration.
