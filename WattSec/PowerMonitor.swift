@@ -124,7 +124,7 @@ class PowerMonitor: ObservableObject {
     }
 
     func fetchWattage() {
-        DispatchQueue.global(qos: .background).async { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
             // Read primary power values from SMC
@@ -247,9 +247,16 @@ class PowerMonitor: ObservableObject {
                 components.append(smoothedComponent("Other", raw: residual))
             }
         } else {
-            // Fallback: PSTR gap method — all external power lumped together
+            // Fallback: PSTR gap method — all external power lumped together.
+            // Use much heavier smoothing (alpha=0.05) to filter out noise from
+            // timing mismatches between PSTR and IOReport sampling rates.
             let unmetered = max(0, wattage - meteredTotal)
-            components.append(smoothedComponent("USB/Ext", raw: unmetered))
+            let prev = componentSmoothed["USB/Ext"] ?? unmetered
+            let smoothed = prev + 0.05 * (unmetered - prev)
+            // Floor small values to zero to avoid jitter around 0
+            let display = smoothed < 0.5 ? 0.0 : smoothed
+            componentSmoothed["USB/Ext"] = smoothed
+            components.append(PowerComponent(label: "USB/Ext", watts: display))
         }
 
         return components
