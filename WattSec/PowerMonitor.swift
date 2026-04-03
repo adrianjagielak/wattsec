@@ -97,14 +97,12 @@ class PowerMonitor: ObservableObject {
             guard let self = self else { return }
 
             // Read primary power values from SMC
-            let rawSoC = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
+            // PSTR = total system power (includes SoC + screen + everything)
+            let rawSystem = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
             let rawDcIn = max(0.0, SMC.shared.getValue("PDTR") ?? 0.0)
 
-            // Screen power from SMC (separate from PSTR — not an SoC subsystem)
+            // Screen power from SMC (included in PSTR, but useful for breakdown)
             let rawScreen = max(0.0, SMC.shared.getValue("PDBR") ?? 0.0)
-
-            // True system total = SoC + Screen
-            let rawSystem = rawSoC + rawScreen
 
             // Read battery less frequently (it changes slowly)
             var snap: BatterySnapshot? = nil
@@ -181,22 +179,36 @@ class PowerMonitor: ObservableObject {
         var components: [PowerComponent] = []
 
         if let io = lastIOReportBreakdown {
-            // Primary IOReport components
-            components.append(smoothedComponent("CPU", raw: io.cpuWatts))
-            components.append(smoothedComponent("GPU", raw: io.gpuTotalWatts))
-            components.append(smoothedComponent("ANE", raw: io.aneWatts))
-            components.append(smoothedComponent("DRAM", raw: io.dramWatts))
+            // IOReport gives SoC component energy. These channels may sum
+            // to more or less than PSTR - PDBR due to measurement differences.
+            // We scale them proportionally so they fit within the SoC budget.
+            let socBudget = max(0, wattage - rawScreen) // PSTR - PDBR
+            let ioTotal = io.totalMeteredWatts
+
+            let scale: Double
+            if ioTotal > 0.1 && socBudget > 0.1 {
+                scale = socBudget / ioTotal
+            } else {
+                scale = 1.0
+            }
+
+            // Primary IOReport components, scaled to match PSTR
+            components.append(smoothedComponent("CPU", raw: io.cpuWatts * scale))
+            components.append(smoothedComponent("GPU", raw: io.gpuTotalWatts * scale))
+            components.append(smoothedComponent("ANE", raw: io.aneWatts * scale))
+            components.append(smoothedComponent("DRAM", raw: io.dramWatts * scale))
 
             // Additional IOReport components (media engines, PCI, etc.)
             for comp in io.otherComponents {
-                components.append(smoothedComponent(comp.label, raw: comp.watts))
+                components.append(smoothedComponent(comp.label, raw: comp.watts * scale))
             }
         }
 
-        // Screen power from SMC PDBR (display backlight, separate from SoC)
+        // Screen power from PDBR (included in PSTR, shown as breakdown)
         components.append(smoothedComponent("Screen", raw: rawScreen))
 
-        // "Other" = total system (PSTR + PDBR) minus all metered components
+        // "Other" = PSTR minus all metered components
+        // Should be small since we scaled IOReport to fit the SoC budget
         let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
         let other = max(0, wattage - meteredTotal)
         components.append(smoothedComponent("Other", raw: other))
