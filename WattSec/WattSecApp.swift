@@ -70,19 +70,28 @@ private struct Constants {
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Properties
-    
+
     private var statusItem: NSStatusItem?
     private var wattageSubscription: AnyCancellable?
-    
+
     private var detailLevel: DetailLevel = Defaults.detailLevel
     private var paceLevel: PaceLevel = Defaults.paceLevel
     private var widthMode: WidthMode = Defaults.widthMode
     private var launchAtLogin: Bool = false
-    
+
     // New properties for fixed width mode
     private var widestWidths: [DetailLevel: [Int: CGFloat]] = [:]
     private var highWattageTimestamp: Date?
     private var highWattageTimer: Timer?
+
+    // Battery info menu items (updated dynamically)
+    private var batteryCapacityItem: NSMenuItem?
+    private var batteryTimeItem: NSMenuItem?
+    private var batteryCyclesItem: NSMenuItem?
+    private var batteryTempItem: NSMenuItem?
+    private var powerSystemItem: NSMenuItem?
+    private var powerDcInItem: NSMenuItem?
+    private var powerNetItem: NSMenuItem?
     
     // MARK: Application Lifecycle
     
@@ -174,6 +183,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
+
+        // Battery section
+        batteryCapacityItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        batteryCapacityItem?.isEnabled = false
+        menu.addItem(batteryCapacityItem!)
+
+        batteryTimeItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        batteryTimeItem?.isEnabled = false
+        menu.addItem(batteryTimeItem!)
+
+        batteryCyclesItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        batteryCyclesItem?.isEnabled = false
+        menu.addItem(batteryCyclesItem!)
+
+        batteryTempItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        batteryTempItem?.isEnabled = false
+        menu.addItem(batteryTempItem!)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Power section
+        powerSystemItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        powerSystemItem?.isEnabled = false
+        menu.addItem(powerSystemItem!)
+
+        powerDcInItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        powerDcInItem?.isEnabled = false
+        menu.addItem(powerDcInItem!)
+
+        powerNetItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        powerNetItem?.isEnabled = false
+        menu.addItem(powerNetItem!)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Settings
         menu.addItem(createDetailMenuItem())
         menu.addItem(createPaceMenuItem())
         menu.addItem(createWidthModeItem())
@@ -297,22 +342,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     // MARK: Display Updates
-    
+
     private func updateWattageDisplay() {
         let fmt = detailLevelFormatString()
         guard let button = statusItem?.button else { return }
 
         let monitor = PowerMonitor.shared
+        let soc = monitor.battery?.socPercent ?? 0
         let wattageText: String
 
         if monitor.isCharging {
             let dcIn = String(format: fmt, monitor.dcInWattage)
-            let netCharge = monitor.dcInWattage - monitor.wattage
-            let netText = String(format: fmt, abs(netCharge))
-            let sign = netCharge >= 0 ? "+" : "-"
-            wattageText = "\(dcIn) \u{26A1}\(sign)\(netText)"
+            let consumption = String(format: fmt, monitor.wattage)
+            wattageText = "\(soc)% \u{26A1}\(dcIn) -\(consumption)"
         } else {
-            wattageText = "-" + String(format: fmt, monitor.wattage)
+            let consumption = String(format: fmt, monitor.wattage)
+            wattageText = "\(soc)% -\(consumption)"
         }
 
         button.title = wattageText
@@ -321,7 +366,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             updateFixedWidth(for: wattageText, wattage: monitor.wattage)
         }
     }
-    
+
+    private func updateBatteryMenuItems() {
+        let monitor = PowerMonitor.shared
+        let bat = monitor.battery
+
+        // Battery section
+        if let bat = bat {
+            batteryCapacityItem?.title = String(format: "Capacity    %.1f / %.1f Wh", bat.currentCapacityWh, bat.maxCapacityWh)
+
+            if monitor.isCharging {
+                if bat.timeToFull > 0 {
+                    batteryTimeItem?.title = String(format: "Time to Full    %d:%02d", bat.timeToFull / 60, bat.timeToFull % 60)
+                } else {
+                    batteryTimeItem?.title = "Time to Full    calculating..."
+                }
+            } else {
+                if bat.timeToEmpty > 0 {
+                    batteryTimeItem?.title = String(format: "Time Left    %d:%02d", bat.timeToEmpty / 60, bat.timeToEmpty % 60)
+                } else {
+                    batteryTimeItem?.title = "Time Left    calculating..."
+                }
+            }
+
+            batteryCyclesItem?.title = "Cycles    \(bat.cycleCount)"
+            batteryTempItem?.title = String(format: "Temp    %.1f\u{00B0}C", bat.temperatureC)
+        }
+
+        // Power section
+        let fmt = detailLevelFormatString()
+        powerSystemItem?.title = "System    " + String(format: fmt, monitor.wattage)
+
+        if monitor.isCharging {
+            powerDcInItem?.title = "DC In    " + String(format: fmt, monitor.dcInWattage)
+            powerDcInItem?.isHidden = false
+            let net = monitor.dcInWattage - monitor.wattage
+            powerNetItem?.title = "To Battery    " + String(format: fmt, net)
+            powerNetItem?.isHidden = false
+        } else {
+            powerDcInItem?.isHidden = true
+            powerNetItem?.isHidden = true
+        }
+    }
+
     private func updateFixedWidth(for wattageText: String, wattage: Double) {
         let charCount = wattageText.count
         let isHighWattage = wattage >= Constants.highWattageThreshold
@@ -446,10 +533,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func bindToPowerMonitor() {
         wattageSubscription = PowerMonitor.shared.$wattage
-            .combineLatest(PowerMonitor.shared.$dcInWattage)
+            .combineLatest(PowerMonitor.shared.$dcInWattage, PowerMonitor.shared.$battery)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _, _ in
+            .sink { [weak self] _, _, _ in
                 self?.updateWattageDisplay()
+                self?.updateBatteryMenuItems()
             }
     }
     
@@ -530,18 +618,23 @@ class PowerMonitor: ObservableObject {
     @Published var wattage: Double = 0.0
     /// Smoothed DC input power (PDTR) — non-zero when charger connected
     @Published var dcInWattage: Double = 0.0
+    /// Latest battery snapshot (updated every ~2 seconds)
+    @Published var battery: BatterySnapshot?
 
-    var isCharging: Bool { dcInWattage > 1.0 }
+    var isCharging: Bool { dcInWattage > Self.chargingThreshold }
 
     private var timer: AnyCancellable?
     private var smoothingAlpha: Double = PaceLevel.medium.smoothingAlpha
     private var isFirstReading = true
     private var wasCharging = false
+    private var batteryReadCounter = 0
 
     /// Fixed sample interval (200ms = 5 updates/sec)
     private static let sampleInterval: TimeInterval = 0.2
     /// Threshold for detecting charger connected
     private static let chargingThreshold: Double = 1.0
+    /// Read battery info every N samples (~2 seconds at 200ms)
+    private static let batteryReadInterval = 10
 
     private init() {
         setupTimer()
@@ -555,6 +648,16 @@ class PowerMonitor: ObservableObject {
         DispatchQueue.global(qos: .background).async { [weak self] in
             let rawSystem = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
             let rawDcIn = max(0.0, SMC.shared.getValue("PDTR") ?? 0.0)
+
+            // Read battery less frequently (it changes slowly)
+            var snap: BatterySnapshot? = nil
+            if let self = self {
+                let counter = self.batteryReadCounter
+                if counter == 0 {
+                    snap = BatteryInfo.shared.snapshot()
+                }
+            }
+
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 let nowCharging = rawDcIn > Self.chargingThreshold
@@ -570,6 +673,11 @@ class PowerMonitor: ObservableObject {
                     self.wattage += alpha * (rawSystem - self.wattage)
                     self.dcInWattage += alpha * (rawDcIn - self.dcInWattage)
                 }
+
+                if snap != nil {
+                    self.battery = snap
+                }
+                self.batteryReadCounter = (self.batteryReadCounter + 1) % Self.batteryReadInterval
             }
         }
     }
