@@ -351,13 +351,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let soc = monitor.battery?.socPercent ?? 0
         let wattageText: String
 
+        let consumption = String(format: fmt, monitor.wattage)
         if monitor.isCharging {
             let dcIn = String(format: fmt, monitor.dcInWattage)
-            let consumption = String(format: fmt, monitor.wattage)
-            wattageText = "\(soc)% \u{26A1}\(dcIn) -\(consumption)"
+            wattageText = "\u{26A1}\(dcIn) -\(consumption) \(soc)%"
         } else {
-            let consumption = String(format: fmt, monitor.wattage)
-            wattageText = "\(soc)% -\(consumption)"
+            wattageText = "-\(consumption) \(soc)%"
         }
 
         button.title = wattageText
