@@ -12,6 +12,7 @@ struct BatterySnapshot {
     let currentCapacityMAh: Int    // AppleRawCurrentCapacity
     let maxCapacityMAh: Int        // AppleRawMaxCapacity
     let designCapacityMAh: Int     // DesignCapacity
+    let socPercent: Int            // CurrentCapacity (macOS's own 0-100%)
     let voltageMV: Int             // Voltage in mV
     let cycleCount: Int
     let isCharging: Bool
@@ -19,12 +20,6 @@ struct BatterySnapshot {
     let temperatureC: Double       // Temperature / 100
     let timeToEmpty: Int           // minutes, -1 if unknown
     let timeToFull: Int            // minutes, -1 if unknown
-
-    /// State of charge as percentage (0-100)
-    var socPercent: Int {
-        guard maxCapacityMAh > 0 else { return 0 }
-        return min(100, (currentCapacityMAh * 100) / maxCapacityMAh)
-    }
 
     /// Current charge in Wh
     var currentCapacityWh: Double {
@@ -62,6 +57,7 @@ class BatteryInfo {
         let currentCap: Int = prop("AppleRawCurrentCapacity") ?? 0
         let maxCap: Int = prop("AppleRawMaxCapacity") ?? prop("MaxCapacity") ?? 0
         let designCap: Int = prop("DesignCapacity") ?? maxCap
+        let socPct: Int = prop("CurrentCapacity") ?? 0
         let voltage: Int = prop("Voltage") ?? 0
         let cycles: Int = prop("CycleCount") ?? 0
         let charging: Bool = prop("IsCharging") ?? false
@@ -74,6 +70,7 @@ class BatteryInfo {
             currentCapacityMAh: currentCap,
             maxCapacityMAh: maxCap,
             designCapacityMAh: designCap,
+            socPercent: socPct,
             voltageMV: voltage,
             cycleCount: cycles,
             isCharging: charging,
