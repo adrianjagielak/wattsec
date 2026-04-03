@@ -2,8 +2,14 @@
 //  PowerMonitor.swift
 //  WattSec
 //
-//  Centralized power monitoring: reads SMC sensors, tracks battery state,
-//  maintains smoothed values and rolling averages for display.
+//  Centralized power monitoring: reads SMC sensors and IOReport energy
+//  counters, tracks battery state, maintains smoothed values and rolling
+//  averages for display.
+//
+//  Uses IOReport for per-component breakdown (CPU, GPU, ANE, DRAM) with
+//  accurate GPU power that includes SRAM (the commonly missed piece).
+//  Falls back to SMC-only breakdown if IOReport is unavailable.
+//  Screen power always comes from SMC (PDBR) since IOReport doesn't track it.
 //
 //  This class is UI-independent and can be reused in any macOS app.
 //
@@ -46,6 +52,8 @@ class PowerMonitor: ObservableObject {
     private static let chargingThreshold: Double = 1.0
     /// Read battery info every N samples (~2 seconds at 200ms)
     private static let batteryReadInterval = 10
+    /// Read IOReport every N samples (~1 second at 200ms)
+    private static let ioReportReadInterval = 5
     /// 5 minutes of samples at 200ms = 1500 entries
     private static let historySize = 1500
 
@@ -55,27 +63,26 @@ class PowerMonitor: ObservableObject {
     private var isFirstReading = true
     private var wasCharging = false
     private var batteryReadCounter = 0
+    private var ioReportReadCounter = 0
     private var wattageHistory: [Double] = []
 
-    /// SMC keys to try for power breakdown.
-    /// Keys that return nil on a given machine are auto-discovered and skipped.
-    private static let smcBreakdownKeys: [(label: String, key: String)] = [
-        ("CPU", "PCPT"),         // CPU Package Total
-        ("CPU", "PCTR"),         // CPU Total Rail (fallback)
-        ("GPU", "PGTR"),         // GPU Total Rail
-        ("ANE", "PANT"),         // Apple Neural Engine
-        ("DRAM", "PDMR"),        // DRAM power
-        ("Screen", "PDBR"),      // Display Brightness
-    ]
+    /// IOReport reader (nil if unavailable on this system)
+    private let ioReportReader = IOReportReader.shared
 
-    /// Tracks which SMC keys actually exist on this machine (discovered on first read)
-    private var availableSmcKeys: [(label: String, key: String)]?
     /// Smoothed values for each component (keyed by label)
     private var componentSmoothed: [String: Double] = [:]
+
+    /// Last IOReport breakdown (updated every ~1s, displayed every 200ms)
+    private var lastIOReportBreakdown: IOReportPowerBreakdown?
 
     // MARK: - Init
 
     private init() {
+        if ioReportReader != nil {
+            print("PowerMonitor: IOReport available — using per-component energy counters")
+        } else {
+            print("PowerMonitor: IOReport unavailable — using SMC-only breakdown")
+        }
         setupTimer()
     }
 
@@ -93,44 +100,31 @@ class PowerMonitor: ObservableObject {
             let rawSystem = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
             let rawDcIn = max(0.0, SMC.shared.getValue("PDTR") ?? 0.0)
 
+            // Screen power from SMC (IOReport doesn't track display)
+            let rawScreen = max(0.0, SMC.shared.getValue("PDBR") ?? 0.0)
+
             // Read battery less frequently (it changes slowly)
             var snap: BatterySnapshot? = nil
             if self.batteryReadCounter == 0 {
                 snap = BatteryInfo.shared.snapshot()
             }
 
-            // Read SMC breakdown keys
-            let smcBreakdown = self.readSmcBreakdown()
+            // Read IOReport less frequently (~1s intervals for meaningful deltas)
+            var ioBreakdown: IOReportPowerBreakdown? = nil
+            if self.ioReportReadCounter == 0, let reader = self.ioReportReader {
+                ioBreakdown = reader.sample()
+            }
 
             DispatchQueue.main.async {
                 self.applyReadings(
                     rawSystem: rawSystem,
                     rawDcIn: rawDcIn,
+                    rawScreen: rawScreen,
                     batterySnap: snap,
-                    smcBreakdown: smcBreakdown
+                    ioBreakdown: ioBreakdown
                 )
             }
         }
-    }
-
-    // MARK: - Private: Reading
-
-    private func readSmcBreakdown() -> [(label: String, key: String, value: Double)] {
-        let keysToRead = availableSmcKeys ?? Self.smcBreakdownKeys
-
-        var results: [(label: String, key: String, value: Double)] = []
-        var seenLabels = Set<String>()
-
-        for (label, key) in keysToRead {
-            // Skip duplicate labels (e.g., CPU has two fallback keys — use first that works)
-            guard !seenLabels.contains(label) else { continue }
-            if let val = SMC.shared.getValue(key) {
-                results.append((label: label, key: key, value: max(0.0, val)))
-                seenLabels.insert(label)
-            }
-        }
-
-        return results
     }
 
     // MARK: - Private: Processing
@@ -138,8 +132,9 @@ class PowerMonitor: ObservableObject {
     private func applyReadings(
         rawSystem: Double,
         rawDcIn: Double,
+        rawScreen: Double,
         batterySnap: BatterySnapshot?,
-        smcBreakdown: [(label: String, key: String, value: Double)]
+        ioBreakdown: IOReportPowerBreakdown?
     ) {
         let nowCharging = rawDcIn > Self.chargingThreshold
 
@@ -151,6 +146,7 @@ class PowerMonitor: ObservableObject {
             wasCharging = nowCharging
             wattageHistory.removeAll()
             componentSmoothed.removeAll()
+            lastIOReportBreakdown = nil
         } else {
             wattage += smoothingAlpha * (rawSystem - wattage)
             dcInWattage += smoothingAlpha * (rawDcIn - dcInWattage)
@@ -162,26 +158,46 @@ class PowerMonitor: ObservableObject {
             wattageHistory.removeFirst()
         }
 
-        // Lock in discovered SMC keys after first successful read
-        if availableSmcKeys == nil && !smcBreakdown.isEmpty {
-            availableSmcKeys = smcBreakdown.map { ($0.label, $0.key) }
+        // Update IOReport breakdown when new data arrives
+        if let io = ioBreakdown {
+            lastIOReportBreakdown = io
         }
 
-        // Smooth component breakdown
-        var breakdown: [PowerComponent] = []
-        for item in smcBreakdown {
-            let prev = componentSmoothed[item.label] ?? item.value
-            let smoothed = prev + smoothingAlpha * (item.value - prev)
-            componentSmoothed[item.label] = smoothed
-            breakdown.append(PowerComponent(label: item.label, watts: smoothed))
-        }
-        powerBreakdown = breakdown
+        // Build component breakdown
+        powerBreakdown = buildBreakdown(rawScreen: rawScreen)
 
         // Update battery snapshot
         if let snap = batterySnap {
             battery = snap
         }
         batteryReadCounter = (batteryReadCounter + 1) % Self.batteryReadInterval
+        ioReportReadCounter = (ioReportReadCounter + 1) % Self.ioReportReadInterval
+    }
+
+    private func buildBreakdown(rawScreen: Double) -> [PowerComponent] {
+        var components: [PowerComponent] = []
+
+        if let io = lastIOReportBreakdown {
+            // IOReport components with smoothing
+            components.append(smoothedComponent("CPU", raw: io.cpuWatts))
+            components.append(smoothedComponent("GPU", raw: io.gpuTotalWatts))
+            if io.aneWatts > 0.01 {
+                components.append(smoothedComponent("ANE", raw: io.aneWatts))
+            }
+            components.append(smoothedComponent("DRAM", raw: io.dramWatts))
+        }
+
+        // Screen power always from SMC
+        components.append(smoothedComponent("Screen", raw: rawScreen))
+
+        return components
+    }
+
+    private func smoothedComponent(_ label: String, raw: Double) -> PowerComponent {
+        let prev = componentSmoothed[label] ?? raw
+        let smoothed = prev + smoothingAlpha * (raw - prev)
+        componentSmoothed[label] = smoothed
+        return PowerComponent(label: label, watts: smoothed)
     }
 
     // MARK: - Private: Timer
