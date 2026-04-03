@@ -8,6 +8,12 @@
 import Foundation
 import IOKit
 
+/// Per-port USB-C power delivery measurement from PD controller hardware.
+struct UsbPortPower {
+    let portIndex: Int       // 1-indexed port number
+    let watts: Double        // Actual measured power delivery in watts
+}
+
 struct BatterySnapshot {
     let currentCapacityMAh: Int    // AppleRawCurrentCapacity
     let maxCapacityMAh: Int        // AppleRawMaxCapacity
@@ -20,6 +26,12 @@ struct BatterySnapshot {
     let temperatureC: Double       // Temperature / 100
     let timeToEmpty: Int           // minutes, -1 if unknown
     let timeToFull: Int            // minutes, -1 if unknown
+    let usbPortPower: [UsbPortPower]  // Per-port USB-C power delivery
+
+    /// Total USB power delivery across all ports
+    var totalUsbPowerWatts: Double {
+        usbPortPower.reduce(0) { $0 + $1.watts }
+    }
 
     /// Current charge in Wh
     var currentCapacityWh: Double {
@@ -66,6 +78,19 @@ class BatteryInfo {
         let tte: Int = prop("AvgTimeToEmpty") ?? -1
         let ttf: Int = prop("AvgTimeToFull") ?? -1
 
+        // Per-port USB-C power delivery (actual measured milliwatts from PD controller)
+        var usbPorts: [UsbPortPower] = []
+        if let details: [[String: Any]] = prop("PowerOutDetails") {
+            for entry in details {
+                let portIndex = entry["PortIndex"] as? Int ?? 0
+                // PDPowermW is milliwatts; fall back to Watts key (also mW despite the name)
+                let mw = entry["PDPowermW"] as? Int ?? entry["Watts"] as? Int ?? 0
+                if mw > 0 {
+                    usbPorts.append(UsbPortPower(portIndex: portIndex, watts: Double(mw) / 1000.0))
+                }
+            }
+        }
+
         return BatterySnapshot(
             currentCapacityMAh: currentCap,
             maxCapacityMAh: maxCap,
@@ -77,7 +102,8 @@ class BatteryInfo {
             isPluggedIn: pluggedIn,
             temperatureC: Double(tempRaw) / 100.0,
             timeToEmpty: tte,
-            timeToFull: ttf
+            timeToFull: ttf,
+            usbPortPower: usbPorts
         )
     }
 }

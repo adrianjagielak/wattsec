@@ -197,6 +197,13 @@ class PowerMonitor: ObservableObject {
         // Screen power from SMC (IOReport doesn't track display)
         components.append(smoothedComponent("Screen", raw: rawScreen))
 
+        // USB power delivery from AppleSmartBattery PowerOutDetails
+        // (actual measured milliwatts from USB-C PD controller hardware)
+        let usbWatts = battery?.totalUsbPowerWatts ?? 0
+        if usbWatts > 0.1 {
+            components.append(smoothedComponent("USB", raw: usbWatts))
+        }
+
         // "Other" = System total minus sum of all metered components
         // Includes: USB power delivery, VRM losses, SoC fabric, unmeasured subsystems
         let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
