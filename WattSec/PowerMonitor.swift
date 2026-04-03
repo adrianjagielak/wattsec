@@ -179,36 +179,25 @@ class PowerMonitor: ObservableObject {
         var components: [PowerComponent] = []
 
         if let io = lastIOReportBreakdown {
-            // IOReport gives SoC component energy. These channels may sum
-            // to more or less than PSTR - PDBR due to measurement differences.
-            // We scale them proportionally so they fit within the SoC budget.
-            let socBudget = max(0, wattage - rawScreen) // PSTR - PDBR
-            let ioTotal = io.totalMeteredWatts
-
-            let scale: Double
-            if ioTotal > 0.1 && socBudget > 0.1 {
-                scale = socBudget / ioTotal
-            } else {
-                scale = 1.0
-            }
-
-            // Primary IOReport components, scaled to match PSTR
-            components.append(smoothedComponent("CPU", raw: io.cpuWatts * scale))
-            components.append(smoothedComponent("GPU", raw: io.gpuTotalWatts * scale))
-            components.append(smoothedComponent("ANE", raw: io.aneWatts * scale))
-            components.append(smoothedComponent("DRAM", raw: io.dramWatts * scale))
+            // IOReport values shown as-is (no scaling).
+            // These are actual energy counter measurements from the SoC.
+            components.append(smoothedComponent("CPU", raw: io.cpuWatts))
+            components.append(smoothedComponent("GPU", raw: io.gpuTotalWatts))
+            components.append(smoothedComponent("ANE", raw: io.aneWatts))
+            components.append(smoothedComponent("DRAM", raw: io.dramWatts))
 
             // Additional IOReport components (media engines, PCI, etc.)
             for comp in io.otherComponents {
-                components.append(smoothedComponent(comp.label, raw: comp.watts * scale))
+                components.append(smoothedComponent(comp.label, raw: comp.watts))
             }
         }
 
-        // Screen power from PDBR (included in PSTR, shown as breakdown)
+        // Screen power from PDBR (included in PSTR)
         components.append(smoothedComponent("Screen", raw: rawScreen))
 
-        // "Other" = PSTR minus all metered components
-        // Should be small since we scaled IOReport to fit the SoC budget
+        // "Other" = PSTR minus all metered components.
+        // Absorbs: USB power delivery, VRM losses, fabric, IOReport measurement drift.
+        // When you plug in a device, this is where the charging power shows up.
         let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
         let other = max(0, wattage - meteredTotal)
         components.append(smoothedComponent("Other", raw: other))
