@@ -31,16 +31,14 @@ enum DetailLevel: Int, CaseIterable {
 }
 
 enum PaceLevel: Int, CaseIterable {
-    case fast = 1
-    case medium = 2
-    case slow = 3
+    case on = 1
+    case off = 0
 
-    /// EMA smoothing factor: higher = more responsive, lower = smoother
+    /// EMA smoothing factor: 0.1 = smooth, 1.0 = raw values
     var smoothingAlpha: Double {
         switch self {
-        case .fast: return 0.35
-        case .medium: return 0.2
-        case .slow: return 0.1
+        case .on: return 0.1
+        case .off: return 1.0
         }
     }
 }
@@ -54,7 +52,7 @@ enum WidthMode: String, CaseIterable {
 
 private struct Defaults {
     static let detailLevel: DetailLevel = .medium
-    static let paceLevel: PaceLevel = .fast
+    static let paceLevel: PaceLevel = .on
     static let widthMode: WidthMode = .dynamic
 }
 
@@ -117,7 +115,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func loadUserPreferences() {
         let defaults = UserDefaults.standard
-        let currentVersion = 2
+        let currentVersion = 3
         let savedVersion = defaults.integer(forKey: "settingsVersion")
         
         if savedVersion < currentVersion {
@@ -263,20 +261,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     private func createPaceMenuItem() -> NSMenuItem {
-        let menuItem = NSMenuItem(title: "Smoothing", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-
-        for level in PaceLevel.allCases {
-            let label = String(describing: level).capitalized
-            let item = NSMenuItem(title: label, action: #selector(changePace), keyEquivalent: "")
-            item.representedObject = level.rawValue
-            item.target = self
-            item.state = level == paceLevel ? .on : .off
-            submenu.addItem(item)
-        }
-
-        menuItem.submenu = submenu
-        return menuItem
+        let item = NSMenuItem(title: "Smoothing", action: #selector(toggleSmoothing), keyEquivalent: "")
+        item.target = self
+        item.state = paceLevel == .on ? .on : .off
+        return item
     }
     
     private func createWidthModeItem() -> NSMenuItem {
@@ -321,14 +309,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenuStates(sender.menu, selectedValue: rawValue)
     }
     
-    @objc private func changePace(sender: NSMenuItem) {
-        guard let rawValue = sender.representedObject as? Int,
-              let newPace = PaceLevel(rawValue: rawValue) else { return }
-        
-        paceLevel = newPace
-        UserDefaults.standard.set(rawValue, forKey: "paceLevel")
-        PowerMonitor.shared.updatePace(newPace.smoothingAlpha)
-        updateMenuStates(sender.menu, selectedValue: rawValue)
+    @objc private func toggleSmoothing(sender: NSMenuItem) {
+        paceLevel = paceLevel == .on ? .off : .on
+        UserDefaults.standard.set(paceLevel.rawValue, forKey: "paceLevel")
+        PowerMonitor.shared.updatePace(paceLevel.smoothingAlpha)
+        sender.state = paceLevel == .on ? .on : .off
     }
     
     @objc private func changeWidthMode(sender: NSMenuItem) {
