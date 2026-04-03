@@ -89,9 +89,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var batteryTimeItem: NSMenuItem?
     private var batteryCyclesItem: NSMenuItem?
     private var batteryTempItem: NSMenuItem?
-    private var powerSystemItem: NSMenuItem?
-    private var powerDcInItem: NSMenuItem?
-    private var powerNetItem: NSMenuItem?
+    private var powerSeparatorItem: NSMenuItem?
+    private var powerSectionStartIndex: Int = 0
+    private var powerMenuItems: [NSMenuItem] = []
     
     // MARK: Application Lifecycle
     
@@ -201,20 +201,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         batteryTempItem?.isEnabled = false
         menu.addItem(batteryTempItem!)
 
-        menu.addItem(NSMenuItem.separator())
-
-        // Power section
-        powerSystemItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
-        powerSystemItem?.isEnabled = false
-        menu.addItem(powerSystemItem!)
-
-        powerDcInItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
-        powerDcInItem?.isEnabled = false
-        menu.addItem(powerDcInItem!)
-
-        powerNetItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
-        powerNetItem?.isEnabled = false
-        menu.addItem(powerNetItem!)
+        // Power section separator
+        powerSeparatorItem = NSMenuItem.separator()
+        menu.addItem(powerSeparatorItem!)
+        powerSectionStartIndex = menu.items.count
 
         menu.addItem(NSMenuItem.separator())
 
@@ -426,19 +416,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             batteryTempItem?.title = String(format: "Temp    %.1f\u{00B0}C", bat.temperatureC)
         }
 
-        // Power section
+        // Power breakdown section — rebuild dynamically
+        guard let menu = statusItem?.menu else { return }
         let fmt = detailLevelFormatString()
-        powerSystemItem?.title = "System    " + String(format: fmt, monitor.wattage)
 
+        // Remove old power items
+        for item in powerMenuItems {
+            menu.removeItem(item)
+        }
+        powerMenuItems.removeAll()
+
+        var insertIndex = powerSectionStartIndex
+
+        func addPowerItem(_ title: String) {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.insertItem(item, at: insertIndex)
+            powerMenuItems.append(item)
+            insertIndex += 1
+        }
+
+        // System total
+        addPowerItem("System    " + String(format: fmt, monitor.wattage))
+
+        // Charging info
         if monitor.isCharging {
-            powerDcInItem?.title = "DC In    " + String(format: fmt, monitor.dcInWattage)
-            powerDcInItem?.isHidden = false
+            addPowerItem("DC In    " + String(format: fmt, monitor.dcInWattage))
             let net = monitor.dcInWattage - monitor.wattage
-            powerNetItem?.title = "To Battery    " + String(format: fmt, net)
-            powerNetItem?.isHidden = false
-        } else {
-            powerDcInItem?.isHidden = true
-            powerNetItem?.isHidden = true
+            addPowerItem("To Battery    " + String(format: fmt, net))
+        }
+
+        // Component breakdown
+        if !monitor.powerBreakdown.isEmpty {
+            addPowerItem("") // blank spacer
+            for component in monitor.powerBreakdown {
+                addPowerItem("  \(component.label)    " + String(format: fmt, component.watts))
+            }
         }
     }
 
@@ -653,6 +666,8 @@ class PowerMonitor: ObservableObject {
     @Published var dcInWattage: Double = 0.0
     /// Latest battery snapshot (updated every ~2 seconds)
     @Published var battery: BatterySnapshot?
+    /// Smoothed power breakdown by component
+    @Published var powerBreakdown: [(label: String, watts: Double)] = []
 
     var isCharging: Bool { dcInWattage > Self.chargingThreshold }
 
@@ -678,6 +693,23 @@ class PowerMonitor: ObservableObject {
     /// 5 minutes of samples at 200ms = 1500 entries
     private static let historySize = 1500
 
+    /// SMC keys to try for power breakdown (label, key)
+    /// Keys that return nil on a given machine are auto-discovered and skipped
+    private static let breakdownKeys: [(label: String, key: String)] = [
+        ("CPU", "PCPT"),         // CPU Package Total
+        ("CPU", "PCTR"),         // CPU Total Rail (fallback)
+        ("GPU", "PGTR"),         // GPU Total Rail
+        ("ANE", "PANT"),         // Apple Neural Engine
+        ("DRAM", "PDMR"),        // DRAM power
+        ("Screen", "PDBR"),      // Display Brightness
+        ("Heatpipe", "PHPC"),    // Heatpipe (SoC thermal)
+    ]
+
+    /// Tracks which keys actually exist on this machine (discovered on first read)
+    private var availableBreakdownKeys: [(label: String, key: String)]?
+    /// Smoothed values for each breakdown key
+    private var breakdownSmoothed: [String: Double] = [:]
+
     private init() {
         setupTimer()
     }
@@ -700,6 +732,25 @@ class PowerMonitor: ObservableObject {
                 }
             }
 
+            // Read power breakdown keys
+            let keysToRead: [(label: String, key: String)]
+            if let available = self?.availableBreakdownKeys {
+                keysToRead = available
+            } else {
+                keysToRead = Self.breakdownKeys
+            }
+
+            var rawBreakdown: [(label: String, key: String, value: Double)] = []
+            var seenLabels = Set<String>()
+            for (label, key) in keysToRead {
+                // Skip duplicate labels (e.g., CPU has two fallback keys)
+                guard !seenLabels.contains(label) else { continue }
+                if let val = SMC.shared.getValue(key) {
+                    rawBreakdown.append((label: label, key: key, value: max(0.0, val)))
+                    seenLabels.insert(label)
+                }
+            }
+
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 let nowCharging = rawDcIn > Self.chargingThreshold
@@ -711,6 +762,7 @@ class PowerMonitor: ObservableObject {
                     self.isFirstReading = false
                     self.wasCharging = nowCharging
                     self.wattageHistory.removeAll()
+                    self.breakdownSmoothed.removeAll()
                 } else {
                     let alpha = self.smoothingAlpha
                     self.wattage += alpha * (rawSystem - self.wattage)
@@ -722,6 +774,21 @@ class PowerMonitor: ObservableObject {
                 if self.wattageHistory.count > Self.historySize {
                     self.wattageHistory.removeFirst()
                 }
+
+                // Update breakdown with smoothing
+                if self.availableBreakdownKeys == nil && !rawBreakdown.isEmpty {
+                    // Lock in discovered keys after first successful read
+                    self.availableBreakdownKeys = rawBreakdown.map { ($0.label, $0.key) }
+                }
+
+                var breakdown: [(label: String, watts: Double)] = []
+                for item in rawBreakdown {
+                    let prev = self.breakdownSmoothed[item.key] ?? item.value
+                    let smoothed = prev + self.smoothingAlpha * (item.value - prev)
+                    self.breakdownSmoothed[item.key] = smoothed
+                    breakdown.append((label: item.label, watts: smoothed))
+                }
+                self.powerBreakdown = breakdown
 
                 if snap != nil {
                     self.battery = snap
