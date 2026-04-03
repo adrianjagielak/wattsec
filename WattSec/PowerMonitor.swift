@@ -374,7 +374,7 @@ class PowerMonitor: ObservableObject {
             lastSnapMaxWh = stableMaxWh
             interpolatedWh = socCurrentWh
             lastInterpolationTime = now
-            return (stableCurrentWh, stableMaxWh)
+            return (socCurrentWh, stableMaxWh)
         }
 
         // Between % changes: step interpolation forward monotonically
