@@ -358,26 +358,28 @@ class PowerMonitor: ObservableObject {
         if nominalVoltage == 0 {
             nominalVoltage = Double(bat.voltageMV)
         } else {
-            // Slow-track voltage to filter load-dependent fluctuations
             nominalVoltage += 0.01 * (Double(bat.voltageMV) - nominalVoltage)
         }
 
         let stableMaxWh = Double(bat.maxCapacityMAh) * nominalVoltage / 1_000_000.0
-        let stableCurrentWh = Double(bat.currentCapacityMAh) * nominalVoltage / 1_000_000.0
+        // Derive currentWh from macOS SoC% so they're always consistent.
+        // AppleRawCurrentCapacity/AppleRawMaxCapacity doesn't match CurrentCapacity%
+        // because Apple uses non-linear curves, temp compensation, and calibration.
+        let socCurrentWh = stableMaxWh * Double(bat.socPercent) / 100.0
         let now = Date()
 
         // Snap when SoC% changes (new real data from IORegistry)
         if bat.socPercent != lastSnapSocPercent {
             lastSnapSocPercent = bat.socPercent
             lastSnapMaxWh = stableMaxWh
-            interpolatedWh = stableCurrentWh
+            interpolatedWh = socCurrentWh
             lastInterpolationTime = now
             return (stableCurrentWh, stableMaxWh)
         }
 
         // Between % changes: step interpolation forward monotonically
         guard let prevTime = lastInterpolationTime else {
-            return (stableCurrentWh, stableMaxWh)
+            return (socCurrentWh, stableMaxWh)
         }
 
         let dtHours = now.timeIntervalSince(prevTime) / 3600.0
