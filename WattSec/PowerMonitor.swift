@@ -114,9 +114,9 @@ class PowerMonitor: ObservableObject {
 
     /// Interpolated battery capacity
     private var lastSnapSocPercent: Int = -1
-    private var lastSnapWh: Double = 0
     private var lastSnapMaxWh: Double = 0
-    private var lastSnapTime: Date?
+    private var interpolatedWh: Double = 0
+    private var lastInterpolationTime: Date?
     private var nominalVoltage: Double = 0
 
     // MARK: - Init
@@ -364,35 +364,35 @@ class PowerMonitor: ObservableObject {
 
         let stableMaxWh = Double(bat.maxCapacityMAh) * nominalVoltage / 1_000_000.0
         let stableCurrentWh = Double(bat.currentCapacityMAh) * nominalVoltage / 1_000_000.0
+        let now = Date()
 
         // Snap when SoC% changes (new real data from IORegistry)
         if bat.socPercent != lastSnapSocPercent {
             lastSnapSocPercent = bat.socPercent
-            lastSnapWh = stableCurrentWh
             lastSnapMaxWh = stableMaxWh
-            lastSnapTime = Date()
+            interpolatedWh = stableCurrentWh
+            lastInterpolationTime = now
             return (stableCurrentWh, stableMaxWh)
         }
 
-        // Between % changes: interpolate using measured power draw
-        guard let snapTime = lastSnapTime else {
+        // Between % changes: step interpolation forward monotonically
+        guard let prevTime = lastInterpolationTime else {
             return (stableCurrentWh, stableMaxWh)
         }
 
-        let elapsed = Date().timeIntervalSince(snapTime) / 3600.0 // hours
-        let energyUsed = averageWattage * elapsed  // Wh consumed since snap
+        let dtHours = now.timeIntervalSince(prevTime) / 3600.0
+        lastInterpolationTime = now
 
-        // Subtract if discharging, add if charging
-        let interpolated: Double
         if isCharging {
-            let netChargeRate = dcInWattage - wattage
-            let energyAdded = max(0, netChargeRate) * elapsed
-            interpolated = min(lastSnapWh + energyAdded, lastSnapMaxWh)
+            // When charging, only move UP. Use net charge rate clamped to > 0.
+            let netRate = max(0, dcInWattage - wattage)
+            interpolatedWh = min(interpolatedWh + netRate * dtHours, lastSnapMaxWh)
         } else {
-            interpolated = max(0, lastSnapWh - energyUsed)
+            // When discharging, only move DOWN.
+            interpolatedWh = max(0, interpolatedWh - wattage * dtHours)
         }
 
-        return (interpolated, lastSnapMaxWh)
+        return (interpolatedWh, lastSnapMaxWh)
     }
 }
 
