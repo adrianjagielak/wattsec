@@ -349,22 +349,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let monitor = PowerMonitor.shared
         let soc = monitor.battery?.socPercent ?? 0
-        let wattageText: String
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let defaultAttrs: [NSAttributedString.Key: Any] = [.font: font]
 
-        let consumption = String(format: fmt, monitor.wattage)
         if monitor.isCharging {
             let dcIn = String(format: fmt, monitor.dcInWattage)
-            wattageText = "\u{26A1}\(dcIn)  -\(consumption)  \(soc)%"
+            let consumption = String(format: fmt, monitor.wattage)
+            let text = "\u{26A1}\(dcIn)  -\(consumption)  \(soc)%"
+            button.attributedTitle = NSAttributedString(string: text, attributes: defaultAttrs)
         } else {
-            wattageText = "-\(consumption)  \(soc)%"
-        }
+            // Time to 10% SoC based on 5-minute average drain
+            let timeStr = timeToLowBattery(monitor: monitor)
+            let consumption = String(format: fmt, monitor.wattage)
+            let text = "\(timeStr)  -\(consumption)  \(soc)%"
 
-        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        button.attributedTitle = NSAttributedString(string: wattageText, attributes: [.font: font])
+            let attributed = NSMutableAttributedString(string: text, attributes: defaultAttrs)
+
+            // Color the time portion based on SoC
+            let timeRange = NSRange(location: 0, length: timeStr.count)
+            if soc <= 10 {
+                attributed.addAttribute(.foregroundColor, value: NSColor.systemRed, range: timeRange)
+            } else if soc <= 20 {
+                attributed.addAttribute(.foregroundColor, value: NSColor.systemOrange, range: timeRange)
+            }
+
+            button.attributedTitle = attributed
+        }
 
         if widthMode == .fixed {
-            updateFixedWidth(for: wattageText, wattage: monitor.wattage)
+            let text = button.attributedTitle.string
+            updateFixedWidth(for: text, wattage: monitor.wattage)
         }
+    }
+
+    private func timeToLowBattery(monitor: PowerMonitor) -> String {
+        guard let bat = monitor.battery else { return "--:--" }
+
+        let avgPower = monitor.averageWattage
+        guard avgPower > 0.5 else { return "--:--" }
+
+        // Remaining Wh until 10% SoC
+        let targetWh = bat.maxCapacityWh * 0.10
+        let remainingWh = bat.currentCapacityWh - targetWh
+        guard remainingWh > 0 else { return "0:00" }
+
+        let hoursLeft = remainingWh / avgPower
+        let totalMinutes = Int(hoursLeft * 60)
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        return String(format: "%d:%02d", hours, minutes)
     }
 
     private func updateBatteryMenuItems() {
@@ -623,11 +656,18 @@ class PowerMonitor: ObservableObject {
 
     var isCharging: Bool { dcInWattage > Self.chargingThreshold }
 
+    /// 5-minute rolling average of system power (for time estimates)
+    var averageWattage: Double {
+        guard !wattageHistory.isEmpty else { return wattage }
+        return wattageHistory.reduce(0, +) / Double(wattageHistory.count)
+    }
+
     private var timer: AnyCancellable?
     private var smoothingAlpha: Double = PaceLevel.medium.smoothingAlpha
     private var isFirstReading = true
     private var wasCharging = false
     private var batteryReadCounter = 0
+    private var wattageHistory: [Double] = []
 
     /// Fixed sample interval (200ms = 5 updates/sec)
     private static let sampleInterval: TimeInterval = 0.2
@@ -635,6 +675,8 @@ class PowerMonitor: ObservableObject {
     private static let chargingThreshold: Double = 1.0
     /// Read battery info every N samples (~2 seconds at 200ms)
     private static let batteryReadInterval = 10
+    /// 5 minutes of samples at 200ms = 1500 entries
+    private static let historySize = 1500
 
     private init() {
         setupTimer()
@@ -668,10 +710,17 @@ class PowerMonitor: ObservableObject {
                     self.dcInWattage = rawDcIn
                     self.isFirstReading = false
                     self.wasCharging = nowCharging
+                    self.wattageHistory.removeAll()
                 } else {
                     let alpha = self.smoothingAlpha
                     self.wattage += alpha * (rawSystem - self.wattage)
                     self.dcInWattage += alpha * (rawDcIn - self.dcInWattage)
+                }
+
+                // Track rolling 5-minute history for time estimates
+                self.wattageHistory.append(rawSystem)
+                if self.wattageHistory.count > Self.historySize {
+                    self.wattageHistory.removeFirst()
                 }
 
                 if snap != nil {
