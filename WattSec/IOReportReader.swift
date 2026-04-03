@@ -237,26 +237,29 @@ final class IOReportReader {
     }
 
     private func categorize(name: String, watts: Double, into result: inout IOReportPowerBreakdown) {
-        // CPU: ECPU, PCPU, *_CPU, *CPU Energy
-        if name == "ECPU" || name == "PCPU"
-            || name.hasSuffix("_CPU")
-            || name.hasSuffix("CPU Energy") {
+        let n = name.uppercased()
+
+        // CPU: ECPU, PCPU, *_CPU, *CPU Energy, EACC*, PACC*, *CPUDTL*
+        if n.hasPrefix("ECPU") || n.hasPrefix("PCPU")
+            || n.hasPrefix("EACC") || n.hasPrefix("PACC")
+            || n.hasSuffix("_CPU") || n.hasSuffix("CPU ENERGY")
+            || n.contains("CPUDTL") {
             result.cpuWatts += watts
         }
         // GPU SRAM (must check before GPU to avoid false match)
-        else if name.hasPrefix("GPU SRAM") {
+        else if n.hasPrefix("GPU SRAM") || n.hasPrefix("GPU_SRAM") {
             result.gpuSRAMWatts += watts
         }
         // GPU compute: GPU0, GPU Energy, GPU0_0
-        else if name == "GPU Energy" || name.hasPrefix("GPU0") || name == "GPU" {
+        else if n == "GPU ENERGY" || n.hasPrefix("GPU0") || n == "GPU" {
             result.gpuComputeWatts += watts
         }
         // ANE
-        else if name.hasPrefix("ANE") {
+        else if n.hasPrefix("ANE") {
             result.aneWatts += watts
         }
         // DRAM
-        else if name.hasPrefix("DRAM") {
+        else if n.hasPrefix("DRAM") {
             result.dramWatts += watts
         }
         // Everything else — capture if non-trivial

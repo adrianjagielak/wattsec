@@ -94,7 +94,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var powerDcInItem: NSMenuItem?
     private var powerNetItem: NSMenuItem?
     private var powerBreakdownItems: [NSMenuItem] = []
-    private static let maxBreakdownItems = 8
+    private static let maxBreakdownItems = 16
     
     // MARK: Application Lifecycle
     
