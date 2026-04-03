@@ -97,11 +97,14 @@ class PowerMonitor: ObservableObject {
             guard let self = self else { return }
 
             // Read primary power values from SMC
-            let rawSystem = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
+            let rawSoC = max(0.0, SMC.shared.getValue("PSTR") ?? 0.0)
             let rawDcIn = max(0.0, SMC.shared.getValue("PDTR") ?? 0.0)
 
-            // Screen power from SMC (IOReport doesn't track display)
+            // Screen power from SMC (separate from PSTR — not an SoC subsystem)
             let rawScreen = max(0.0, SMC.shared.getValue("PDBR") ?? 0.0)
+
+            // True system total = SoC + Screen
+            let rawSystem = rawSoC + rawScreen
 
             // Read battery less frequently (it changes slowly)
             var snap: BatterySnapshot? = nil
@@ -190,17 +193,12 @@ class PowerMonitor: ObservableObject {
             }
         }
 
-        // Screen power shown as info but NOT added to sum.
-        // PSTR already includes screen power, and IOReport channels
-        // already cover nearly all of PSTR, so adding PDBR would double-count.
-        // Show it as a separate informational item.
-        components.append(PowerComponent(label: "Screen*", watts: rawScreen))
+        // Screen power from SMC PDBR (display backlight, separate from SoC)
+        components.append(smoothedComponent("Screen", raw: rawScreen))
 
-        // "Other" = PSTR total minus IOReport metered total
-        // (does NOT include Screen since Screen is already in PSTR)
-        let ioTotal = components.filter { $0.label != "Screen*" }
-            .reduce(0.0) { $0 + $1.watts }
-        let other = max(0, wattage - ioTotal)
+        // "Other" = total system (PSTR + PDBR) minus all metered components
+        let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
+        let other = max(0, wattage - meteredTotal)
         components.append(smoothedComponent("Other", raw: other))
 
         return components
