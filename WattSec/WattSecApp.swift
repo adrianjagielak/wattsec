@@ -382,14 +382,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func timeToLowBattery(monitor: PowerMonitor) -> String {
-        guard let bat = monitor.battery else { return "--:--" }
+        // Use the same SoC-derived Wh as the Capacity row so the estimate
+        // always agrees with the displayed percentage and capacity.
+        guard let cap = monitor.interpolatedCapacity() else { return "--:--" }
 
         let avgPower = monitor.averageWattage
         guard avgPower > 0.5 else { return "--:--" }
 
         // Remaining Wh until 10% SoC
-        let targetWh = bat.maxCapacityWh * 0.10
-        let remainingWh = bat.currentCapacityWh - targetWh
+        let remainingWh = cap.currentWh - cap.maxWh * 0.10
         guard remainingWh > 0 else { return "0:00" }
 
         let hoursLeft = remainingWh / avgPower
@@ -411,7 +412,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             if monitor.isCharging {
-                if bat.timeToFull > 0 {
+                if !bat.isCharging {
+                    // On AC but the battery isn't taking charge — either
+                    // full or held back (charge limiting / heat). Without
+                    // this check the row says "calculating..." forever.
+                    batteryTimeItem?.title = bat.socPercent >= 100
+                        ? "Fully Charged"
+                        : "Charging Paused"
+                } else if bat.timeToFull > 0 {
                     batteryTimeItem?.title = String(format: "Time to Full    %d:%02d", bat.timeToFull / 60, bat.timeToFull % 60)
                 } else {
                     batteryTimeItem?.title = "Time to Full    calculating..."
@@ -435,8 +443,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if monitor.isCharging {
             powerDcInItem?.title = "DC In    " + String(format: fmt, monitor.dcInWattage)
             powerDcInItem?.isHidden = false
-            let net = monitor.dcInWattage - monitor.wattage
-            powerNetItem?.title = "To Battery    " + String(format: fmt, net)
+            // Prefer the gas gauge's measured battery power over the
+            // DC-in-minus-system estimate, which includes charger
+            // conversion losses and reads nonzero on a full battery.
+            let batteryW = monitor.battery?.batteryPowerW
+                ?? (monitor.dcInWattage - monitor.wattage)
+            if batteryW >= 0 {
+                powerNetItem?.title = "To Battery    " + String(format: fmt, batteryW)
+            } else {
+                powerNetItem?.title = "From Battery    " + String(format: fmt, -batteryW)
+            }
             powerNetItem?.isHidden = false
         } else {
             powerDcInItem?.isHidden = true

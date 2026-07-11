@@ -8,7 +8,9 @@
 //
 //  Uses IOReport for per-component breakdown (CPU, GPU, ANE, DRAM) with
 //  accurate GPU power that includes SRAM (the commonly missed piece).
-//  Falls back to SMC-only breakdown if IOReport is unavailable.
+//  Without IOReport only the system total and screen are measurable; the
+//  remainder is shown as a single "Other" row (no per-component fallback
+//  exists via SMC on Apple Silicon).
 //  Screen power always comes from SMC (PDBR) since IOReport doesn't track it.
 //
 //  USB power measurement strategy (exhaustively researched, April 2026):
@@ -98,11 +100,23 @@ class PowerMonitor: ObservableObject {
     private var ioReportReadCounter = 0
     private var wattageHistory: [Double] = []
 
+    /// Serial queue for sensor reads. SMC and IOReport must not be called
+    /// concurrently, but the timer can fire again while a slow read is
+    /// still in flight — a concurrent global queue would overlap them.
+    private let sampleQueue = DispatchQueue(label: "WattSec.PowerMonitor.sample", qos: .utility)
+    /// Coalesce timer ticks while a sample is still being read.
+    private var sampleInFlight = false
+
     /// IOReport reader (nil if unavailable on this system)
     private let ioReportReader = IOReportReader.shared
 
     /// Smoothed values for each component (keyed by label)
     private var componentSmoothed: [String: Double] = [:]
+
+    /// IOReport "other" channel labels seen so far, in first-seen order.
+    /// Kept so idle components (media engines etc.) decay to zero instead
+    /// of vanishing from the menu the moment a sample omits them.
+    private var knownOtherLabels: [String] = []
 
     /// Last IOReport breakdown (updated every ~1s, displayed every 200ms)
     private var lastIOReportBreakdown: IOReportPowerBreakdown?
@@ -114,7 +128,6 @@ class PowerMonitor: ObservableObject {
 
     /// Interpolated battery capacity
     private var lastSnapSocPercent: Int = -1
-    private var lastSnapMaxWh: Double = 0
     private var interpolatedWh: Double = 0
     private var lastInterpolationTime: Date?
 
@@ -141,8 +154,21 @@ class PowerMonitor: ObservableObject {
         self.smoothingAlpha = smoothingAlpha
     }
 
+    /// Take one sample. Must be called on the main thread (the timer does).
     func fetchWattage() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        // Skip this tick if the previous sample is still being read —
+        // queueing more work behind a stalled read only builds a backlog.
+        guard !sampleInFlight else { return }
+        sampleInFlight = true
+
+        // Decide on the main thread which slow sources to read this tick;
+        // the counters are main-thread state and must not be read off-main.
+        let readBattery = batteryReadCounter == 0
+        let readIOReport = ioReportReadCounter == 0
+        batteryReadCounter = (batteryReadCounter + 1) % Self.batteryReadInterval
+        ioReportReadCounter = (ioReportReadCounter + 1) % Self.ioReportReadInterval
+
+        sampleQueue.async { [weak self] in
             guard let self = self else { return }
 
             // Read primary power values from SMC
@@ -154,18 +180,16 @@ class PowerMonitor: ObservableObject {
             let rawScreen = max(0.0, SMC.shared.getValue("PDBR") ?? 0.0)
 
             // Read battery less frequently (it changes slowly)
-            var snap: BatterySnapshot? = nil
-            if self.batteryReadCounter == 0 {
-                snap = BatteryInfo.shared.snapshot()
-            }
+            let snap: BatterySnapshot? = readBattery ? BatteryInfo.shared.snapshot() : nil
 
             // Read IOReport less frequently (~1s intervals for meaningful deltas)
             var ioBreakdown: IOReportPowerBreakdown? = nil
-            if self.ioReportReadCounter == 0, let reader = self.ioReportReader {
+            if readIOReport, let reader = self.ioReportReader {
                 ioBreakdown = reader.sample()
             }
 
             DispatchQueue.main.async {
+                self.sampleInFlight = false
                 self.applyReadings(
                     rawSystem: rawSystem,
                     rawDcIn: rawDcIn,
@@ -210,19 +234,24 @@ class PowerMonitor: ObservableObject {
 
         // Update IOReport breakdown when new data arrives
         if let io = ioBreakdown {
+            if lastIOReportBreakdown == nil {
+                // While IOReport was missing the residual was labeled
+                // "Other" and covered the whole SoC — drop that EMA so a
+                // later per-port residual doesn't inherit its magnitude.
+                componentSmoothed.removeValue(forKey: "Other")
+            }
             lastIOReportBreakdown = io
         }
 
-        // Build component breakdown
-        powerBreakdown = buildBreakdown(rawScreen: rawScreen)
-
-        // Update battery snapshot and per-port USB power
+        // Update battery snapshot and per-port USB power before building
+        // the breakdown so it uses this tick's port data.
         if let snap = batterySnap {
             battery = snap
             usbPortPower = snap.usbPortPower
         }
-        batteryReadCounter = (batteryReadCounter + 1) % Self.batteryReadInterval
-        ioReportReadCounter = (ioReportReadCounter + 1) % Self.ioReportReadInterval
+
+        // Build component breakdown
+        powerBreakdown = buildBreakdown(rawScreen: rawScreen)
     }
 
     private func buildBreakdown(rawScreen: Double) -> [PowerComponent] {
@@ -236,9 +265,22 @@ class PowerMonitor: ObservableObject {
             components.append(smoothedComponent("ANE", raw: io.aneWatts))
             components.append(smoothedComponent("DRAM", raw: io.dramWatts))
 
-            // Additional IOReport components (media engines, PCI, etc.)
+            // Additional IOReport components (media engines, PCI, etc.).
+            // A channel that goes idle disappears from the sample; feed 0
+            // into its EMA so the row decays smoothly and only hide it
+            // once it's genuinely near zero — no flickering rows.
+            var currentOther: [String: Double] = [:]
             for comp in io.otherComponents {
-                components.append(smoothedComponent(comp.label, raw: comp.watts))
+                currentOther[comp.label, default: 0] += comp.watts
+            }
+            for label in currentOther.keys.sorted() where !knownOtherLabels.contains(label) {
+                knownOtherLabels.append(label)
+            }
+            for label in knownOtherLabels {
+                let comp = smoothedComponent(label, raw: currentOther[label] ?? 0)
+                if comp.watts >= 0.05 {
+                    components.append(comp)
+                }
             }
         }
 
@@ -266,15 +308,19 @@ class PowerMonitor: ObservableObject {
             }
         } else {
             // Fallback: PSTR gap method — all external power lumped together.
+            // Only call the gap "USB/Ext" when IOReport is metering the SoC;
+            // without IOReport the gap is mostly the SoC itself, so labeling
+            // it USB would be misleading — call it "Other".
+            let residualLabel = lastIOReportBreakdown != nil ? "USB/Ext" : "Other"
             // Use much heavier smoothing (alpha=0.05) to filter out noise from
             // timing mismatches between PSTR and IOReport sampling rates.
             let unmetered = max(0, wattage - meteredTotal)
-            let prev = componentSmoothed["USB/Ext"] ?? unmetered
+            let prev = componentSmoothed[residualLabel] ?? unmetered
             let smoothed = prev + 0.05 * (unmetered - prev)
             // Floor small values to zero to avoid jitter around 0
             let display = smoothed < 0.5 ? 0.0 : smoothed
-            componentSmoothed["USB/Ext"] = smoothed
-            components.append(PowerComponent(label: "USB/Ext", watts: display))
+            componentSmoothed[residualLabel] = smoothed
+            components.append(PowerComponent(label: residualLabel, watts: display))
         }
 
         return components
@@ -347,51 +393,70 @@ class PowerMonitor: ObservableObject {
     }
 
     private func onUsbDeviceChanged() {
-        // Reset USB/Ext smoothing so it converges fast on the new value
+        // Reset USB smoothing so it converges fast on the new value —
+        // both the aggregate gap row and any per-port rows.
         componentSmoothed.removeValue(forKey: "USB/Ext")
+        let portKeys = componentSmoothed.keys.filter { $0.hasPrefix("USB Port ") }
+        for key in portKeys {
+            componentSmoothed.removeValue(forKey: key)
+        }
     }
 
     // MARK: - Private: Interpolated Battery
 
-    /// Update interpolated battery Wh using measured power draw.
-    /// Snaps to real IORegistry values when SoC% changes, interpolates between.
+    /// Update interpolated battery Wh using measured battery power.
+    /// Snaps to real IORegistry values when SoC% changes and interpolates
+    /// between; never strays more than 1% (the SoC granularity) from the
+    /// SoC-derived value, so rate errors can't accumulate into drift.
     func interpolatedCapacity() -> (currentWh: Double, maxWh: Double)? {
-        guard let bat = battery else { return nil }
+        guard let bat = battery, bat.maxCapacityMAh > 0 else { return nil }
 
-        let stableMaxWh = Double(bat.maxCapacityMAh) * Self.nominalVoltage / 1_000_000.0
+        let maxWh = Double(bat.maxCapacityMAh) * Self.nominalVoltage / 1_000_000.0
         // Derive currentWh from macOS SoC% so they're always consistent.
         // AppleRawCurrentCapacity/AppleRawMaxCapacity doesn't match CurrentCapacity%
         // because Apple uses non-linear curves, temp compensation, and calibration.
-        let socCurrentWh = stableMaxWh * Double(bat.socPercent) / 100.0
+        let socCurrentWh = maxWh * Double(bat.socPercent) / 100.0
         let now = Date()
 
         // Snap when SoC% changes (new real data from IORegistry)
         if bat.socPercent != lastSnapSocPercent {
             lastSnapSocPercent = bat.socPercent
-            lastSnapMaxWh = stableMaxWh
             interpolatedWh = socCurrentWh
             lastInterpolationTime = now
-            return (socCurrentWh, stableMaxWh)
+            return (socCurrentWh, maxWh)
         }
 
-        // Between % changes: step interpolation forward monotonically
+        // Between % changes: step interpolation forward
         guard let prevTime = lastInterpolationTime else {
-            return (socCurrentWh, stableMaxWh)
+            lastInterpolationTime = now
+            return (socCurrentWh, maxWh)
         }
 
         let dtHours = now.timeIntervalSince(prevTime) / 3600.0
         lastInterpolationTime = now
 
-        if isCharging {
-            // When charging, only move UP. Use net charge rate clamped to > 0.
-            let netRate = max(0, dcInWattage - wattage)
-            interpolatedWh = min(interpolatedWh + netRate * dtHours, lastSnapMaxWh)
+        if let batteryW = bat.batteryPowerW {
+            // Gas gauge measurement (signed): the actual energy flow into
+            // or out of the battery. Correctly stays flat when the charger
+            // holds the battery (full, or charge limiting), and follows
+            // real drain when the system outdraws the charger.
+            interpolatedWh += batteryW * dtHours
+        } else if isCharging {
+            // Estimate fallback: net charge rate, only move up
+            interpolatedWh += max(0, dcInWattage - wattage) * dtHours
         } else {
-            // When discharging, only move DOWN.
-            interpolatedWh = max(0, interpolatedWh - wattage * dtHours)
+            // Estimate fallback: system drain, only move down
+            interpolatedWh -= wattage * dtHours
         }
 
-        return (interpolatedWh, lastSnapMaxWh)
+        // SoC% has 1% granularity, so the true charge can't be more than
+        // one percent away from the SoC-derived value. Clamp to that band
+        // so interpolation can't wander while the percentage holds still.
+        let band = maxWh / 100.0
+        interpolatedWh = min(max(interpolatedWh, socCurrentWh - band), socCurrentWh + band)
+        interpolatedWh = min(max(interpolatedWh, 0), maxWh)
+
+        return (interpolatedWh, maxWh)
     }
 }
 

@@ -193,6 +193,10 @@ final class IOReportReader {
 
         let elapsed = now.timeIntervalSince(prevTime)
         guard elapsed > 0.01 else { return nil } // Too short for meaningful delta
+        // A long gap means the baseline is stale (system slept, sampling
+        // paused): the delta would be diluted across wall-clock time the
+        // counters weren't running. Drop it and re-baseline (defer above).
+        guard elapsed < 30 else { return nil }
 
         guard let deltaRef = fnCreateSamplesDelta(prev, currentSample, nil) else {
             return nil
@@ -224,7 +228,9 @@ final class IOReportReader {
                 .trimmingCharacters(in: .whitespaces) ?? "nJ"
 
             let rawValue = fnGetIntValue(cfItem, 0)
-            let watts = energyToWatts(rawValue, unit: unitStr, elapsed: elapsed)
+            // Counters can reset (e.g. across sleep/wake) producing a
+            // negative delta — never report negative power.
+            let watts = max(0, energyToWatts(rawValue, unit: unitStr, elapsed: elapsed))
 
             // Robust matching handles all chip variants:
             //   Base: ECPU, PCPU, GPU0, GPU SRAM0, ANE0, DRAM0
@@ -301,7 +307,7 @@ final class IOReportReader {
         case "mJ": return rate / 1e3
         case "uJ": return rate / 1e6
         case "nJ": return rate / 1e9
-        default:   return rate / 1e6 // Fallback: assume uJ
+        default:   return rate / 1e9 // Fallback: assume nJ (matches missing-label default)
         }
     }
 }

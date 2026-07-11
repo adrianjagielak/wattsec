@@ -31,6 +31,7 @@ struct BatterySnapshot {
     let designCapacityMAh: Int     // DesignCapacity
     let socPercent: Int            // CurrentCapacity (macOS's own 0-100%)
     let voltageMV: Int             // Voltage in mV
+    let amperageMA: Int?           // Amperage in mA: + charging, − discharging
     let cycleCount: Int
     let isCharging: Bool
     let isPluggedIn: Bool
@@ -44,14 +45,14 @@ struct BatterySnapshot {
         usbPortPower.reduce(0) { $0 + $1.watts }
     }
 
-    /// Current charge in Wh
-    var currentCapacityWh: Double {
-        Double(currentCapacityMAh) * Double(voltageMV) / 1_000_000.0
-    }
-
-    /// Max (usable) capacity in Wh
-    var maxCapacityWh: Double {
-        Double(maxCapacityMAh) * Double(voltageMV) / 1_000_000.0
+    /// Measured battery charge/discharge power from the gas gauge (W).
+    /// Positive while charging, negative while discharging, ~0 when the
+    /// battery is full or charging is on hold. This is the ground truth
+    /// for energy actually entering/leaving the battery — unlike
+    /// PDTR − PSTR, it excludes charger conversion losses.
+    var batteryPowerW: Double? {
+        guard let amperageMA = amperageMA else { return nil }
+        return Double(amperageMA) * Double(voltageMV) / 1_000_000.0
     }
 
     /// Battery health percentage
@@ -86,8 +87,22 @@ class BatteryInfo {
         let charging: Bool = prop("IsCharging") ?? false
         let pluggedIn: Bool = prop("ExternalConnected") ?? false
         let tempRaw: Int = prop("Temperature") ?? 0
-        let tte: Int = prop("AvgTimeToEmpty") ?? -1
-        let ttf: Int = prop("AvgTimeToFull") ?? -1
+
+        // Amperage: signed mA, positive while charging. Some firmware exposes
+        // it as an unsigned container holding a 32-bit two's complement value.
+        var amperage: Int? = prop("Amperage")
+        if let raw = amperage, raw > Int(Int32.max) {
+            amperage = raw - (Int(UInt32.max) + 1)
+        }
+
+        // IOKit reports 65535 (0xFFFF) for "unknown / still calculating".
+        // Without this check the UI shows "Time Left 1092:15".
+        func estimateMinutes(_ key: String) -> Int {
+            let value: Int = prop(key) ?? -1
+            return (value <= 0 || value >= 65535) ? -1 : value
+        }
+        let tte = estimateMinutes("AvgTimeToEmpty")
+        let ttf = estimateMinutes("AvgTimeToFull")
 
         // Per-port USB-C power delivery (actual measured milliwatts from PD controller).
         // PowerOutDetails is an undocumented property that provides hardware-measured
@@ -125,6 +140,7 @@ class BatteryInfo {
             designCapacityMAh: designCap,
             socPercent: socPct,
             voltageMV: voltage,
+            amperageMA: amperage,
             cycleCount: cycles,
             isCharging: charging,
             isPluggedIn: pluggedIn,
