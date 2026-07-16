@@ -57,7 +57,7 @@ class PowerMonitor: ObservableObject {
     @Published var wattage: Double = 0.0
     /// Smoothed DC input power (PDTR) — non-zero when charger connected
     @Published var dcInWattage: Double = 0.0
-    /// Latest battery snapshot (updated every ~2 seconds)
+    /// Latest battery snapshot (updated every ~1 second)
     @Published var battery: BatterySnapshot?
     /// Smoothed power breakdown by component
     @Published var powerBreakdown: [PowerComponent] = []
@@ -93,19 +93,22 @@ class PowerMonitor: ObservableObject {
     static let sampleInterval: TimeInterval = 0.2
     /// Threshold for detecting charger connected
     private static let chargingThreshold: Double = 1.0
-    /// Read battery info every N samples (~2 seconds at 200ms)
-    private static let batteryReadInterval = 10
-    /// Read IOReport every N samples (~1 second at 200ms)
+    /// Read battery info every N samples (~1 second at 200ms).
+    /// Voltage/Amperage are instantaneous values (unlike IOReport's
+    /// accumulating counters), so a finer cadence genuinely adds data —
+    /// both for display and for the diagnostics log.
+    private static let batteryReadInterval = 5
+    /// Read IOReport every N samples (~1 second at 200ms).
+    /// The energy counters are integrals: sampling slower loses no energy,
+    /// only attribution granularity, so 1s is effectively lossless.
     private static let ioReportReadInterval = 5
     /// 5 minutes of samples at 200ms = 1500 entries
     private static let historySize = 1500
-    /// ~5 minutes of battery gauge reads at ~2s
-    private static let dischargeHistorySize = 150
+    /// ~5 minutes of battery gauge reads at ~1s
+    private static let dischargeHistorySize = 300
     /// EMA for the PSTR↔IOReport gap, applied once per IOReport interval
     /// (~1s): time constant ≈ 5s
     private static let gapSmoothingAlpha = 0.2
-    /// Write a diagnostics record every N samples (~5s at 200ms)
-    private static let diagLogInterval = 25
 
     // MARK: - Private State
 
@@ -114,7 +117,6 @@ class PowerMonitor: ObservableObject {
     private var wasCharging = false
     private var batteryReadCounter = 0
     private var ioReportReadCounter = 0
-    private var diagLogCounter = 0
     private var wattageHistory: [Double] = []
     /// Measured battery drain samples (gas gauge, positive W) — the true
     /// discharge rate including conversion losses that PSTR misses.
@@ -327,26 +329,29 @@ class PowerMonitor: ObservableObject {
         // Build component breakdown
         powerBreakdown = buildBreakdown(rawScreen: rawScreen)
 
-        // Periodic full-state record for offline calibration
-        diagLogCounter = (diagLogCounter + 1) % Self.diagLogInterval
-        if diagLogCounter == 0 {
-            logDiagnostics(
-                rawSystem: rawSystem,
-                rawDcIn: rawDcIn,
-                rawScreen: rawScreen,
-                ioBreakdown: ioBreakdown
-            )
-        }
+        // Diagnostics: one record per tick (200ms). IOReport/battery
+        // sub-objects are attached only on the tick where that source
+        // produced fresh data — logging a source faster than it updates
+        // adds bytes, not information.
+        logDiagnostics(
+            rawSystem: rawSystem,
+            rawDcIn: rawDcIn,
+            rawScreen: rawScreen,
+            ioBreakdown: ioBreakdown,
+            batterySnap: batterySnap
+        )
     }
 
-    /// Write one diagnostics record: raw SMC values, the latest IOReport
-    /// per-channel watts, the full battery property table, and the app's
-    /// derived values — everything needed to fit calibration offline.
+    /// Write one diagnostics record: raw SMC values every tick, fresh
+    /// IOReport per-channel watts (~1s), the fresh full battery property
+    /// table (~1s), and the app's derived values — everything needed to
+    /// fit calibration offline.
     private func logDiagnostics(
         rawSystem: Double,
         rawDcIn: Double,
         rawScreen: Double,
-        ioBreakdown: IOReportPowerBreakdown?
+        ioBreakdown: IOReportPowerBreakdown?,
+        batterySnap: BatterySnapshot?
     ) {
         guard DiagnosticsLogger.shared.isEnabled else { return }
 
@@ -370,7 +375,8 @@ class PowerMonitor: ObservableObject {
         }
         record["derived"] = derived
 
-        if let io = ioBreakdown ?? lastIOReportBreakdown {
+        // Fresh IOReport delta this tick (already a ~1s average by nature)
+        if let io = ioBreakdown {
             var ioDict: [String: Any] = [
                 "cpu": io.cpuWatts,
                 "gpu": io.gpuComputeWatts,
@@ -385,11 +391,12 @@ class PowerMonitor: ObservableObject {
             record["ioreport"] = ioDict
         }
 
-        // The complete AppleSmartBattery property table: raw + user-facing
-        // capacities, PowerTelemetryData, BatteryData, ChargerData,
-        // AdapterDetails, CellVoltage, PowerOutDetails, ...
-        if let bat = battery {
-            record["battery"] = bat.rawProperties
+        // Fresh battery dump this tick: the complete AppleSmartBattery
+        // property table — raw + user-facing capacities, PowerTelemetryData,
+        // BatteryData, ChargerData, AdapterDetails, CellVoltage,
+        // PowerOutDetails, ...
+        if let snap = batterySnap {
+            record["battery"] = snap.rawProperties
         }
 
         DiagnosticsLogger.shared.log(record)

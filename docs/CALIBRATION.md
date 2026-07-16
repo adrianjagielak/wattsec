@@ -13,23 +13,29 @@ offline from days of real-world data.
    some heavy load, USB devices plugged/unplugged, and at least one session
    from 100% down below 10% if practical.
 2. Collect `~/Library/Logs/WattSec/wattsec-*.jsonl` (one file per UTC day,
-   one JSON object per line, every ~5 s, ~20–40 MB/day, auto-pruned after
-   14 days).
+   one JSON object per sampling tick — 200 ms — ~300–400 MB/day, hard cap
+   1 GB/day, auto-pruned after 14 days; zip them before transfer, JSONL
+   compresses ~10×).
 3. Analyze the data (see below), derive constants/curves, fold them into the
    app, and repeat until the residuals stop improving (expected: 1–3 rounds).
 
 ## Record format
 
-Each line has:
+One record per 200 ms sampling tick. Each source appears at the rate it
+actually updates — logging a source faster than it refreshes would add
+bytes, not information:
 
-| Field | Contents |
-|---|---|
-| `ts` | ISO 8601 wall-clock timestamp |
-| `uptime` | seconds awake since boot (monotonic; pauses during sleep) |
-| `smc` | raw SMC watts: `PSTR` (system total), `PDTR` (DC in), `PDBR` (screen) |
-| `ioreport` | per-channel SoC watts from Energy Model counters: `cpu`, `gpu`, `gpuSram`, `ane`, `dram`, `total`, plus `o_<label>` for every other channel |
-| `battery` | the **complete** AppleSmartBattery property table (binary blobs stripped) |
-| `derived` | what the app computed: `wattageEMA`, `dcInEMA`, `gapW` (time-aligned unmetered gap), `avgW5m`, `avgDischargeW5m`, `interpWh`, `interpMaxWh` |
+| Field | Cadence | Contents |
+|---|---|---|
+| `ts` | every record | ISO 8601 wall-clock timestamp |
+| `uptime` | every record | seconds awake since boot (monotonic; pauses during sleep) |
+| `smc` | every record (200 ms) | raw SMC watts: `PSTR` (system total), `PDTR` (DC in), `PDBR` (screen) |
+| `derived` | every record | what the app computed: `wattageEMA`, `dcInEMA`, `gapW` (time-aligned unmetered gap), `avgW5m`, `avgDischargeW5m`, `interpWh`, `interpMaxWh` |
+| `ioreport` | ~1 s (fresh delta ticks only) | per-channel SoC watts from Energy Model counters: `cpu`, `gpu`, `gpuSram`, `ane`, `dram`, `total`, plus `o_<label>` for every other channel. The counters are accumulating integrals, so 1 s sampling loses no energy — only attribution granularity. |
+| `battery` | ~1 s (fresh gauge ticks only) | the **complete** AppleSmartBattery property table (binary blobs stripped). Voltage/Amperage are instantaneous values, so this cadence is what bounds integration accuracy. |
+
+Lines with `"type": "meta"` mark app launches and day rollovers and carry
+the hardware model, macOS version, and app version.
 
 Interesting `battery` keys captured for calibration:
 
@@ -75,5 +81,5 @@ Interesting `battery` keys captured for calibration:
   named `derived` values), so filtering choices can be re-made offline.
 - Timestamps are wall-clock; `uptime` disambiguates sleep gaps (wall time
   advances, uptime doesn't).
-- Logging costs one IORegistry dump per 5 s (it reuses the battery snapshot
-  the app already takes) and an async file append — negligible power.
+- Logging reuses the samples the app already takes (no extra sensor reads)
+  and buffers writes into ~2 s batches — negligible power and I/O.
