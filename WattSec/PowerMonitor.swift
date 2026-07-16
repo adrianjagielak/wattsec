@@ -76,6 +76,15 @@ class PowerMonitor: ObservableObject {
         return wattageHistory.reduce(0, +) / Double(wattageHistory.count)
     }
 
+    /// 5-minute rolling average of measured battery drain (gas gauge, W).
+    /// This is the correct divisor for battery-time estimates: it includes
+    /// the regulator/conversion losses between battery and system rail
+    /// that PSTR doesn't see. Nil until at least one sample exists.
+    var averageDischargeWatts: Double? {
+        guard !dischargePowerHistory.isEmpty else { return nil }
+        return dischargePowerHistory.reduce(0, +) / Double(dischargePowerHistory.count)
+    }
+
     // MARK: - Configuration
 
     private var smoothingAlpha: Double = 0.2
@@ -90,6 +99,13 @@ class PowerMonitor: ObservableObject {
     private static let ioReportReadInterval = 5
     /// 5 minutes of samples at 200ms = 1500 entries
     private static let historySize = 1500
+    /// ~5 minutes of battery gauge reads at ~2s
+    private static let dischargeHistorySize = 150
+    /// EMA for the PSTR↔IOReport gap, applied once per IOReport interval
+    /// (~1s): time constant ≈ 5s
+    private static let gapSmoothingAlpha = 0.2
+    /// Write a diagnostics record every N samples (~5s at 200ms)
+    private static let diagLogInterval = 25
 
     // MARK: - Private State
 
@@ -98,7 +114,23 @@ class PowerMonitor: ObservableObject {
     private var wasCharging = false
     private var batteryReadCounter = 0
     private var ioReportReadCounter = 0
+    private var diagLogCounter = 0
     private var wattageHistory: [Double] = []
+    /// Measured battery drain samples (gas gauge, positive W) — the true
+    /// discharge rate including conversion losses that PSTR misses.
+    private var dischargePowerHistory: [Double] = []
+
+    /// Accumulators aligning raw PSTR/screen samples with the ~1s window
+    /// each IOReport delta covers, so the unmetered gap compares averages
+    /// over the SAME time span instead of an instantaneous PSTR reading
+    /// against a 1-second energy average.
+    private var windowSystemSum: Double = 0
+    private var windowScreenSum: Double = 0
+    private var windowSampleCount: Int = 0
+    /// Smoothed, time-aligned unmetered gap (signed — negatives are kept
+    /// so noise isn't rectified into an upward bias; clamped only at
+    /// display time).
+    private var smoothedGapW: Double?
 
     /// Serial queue for sensor reads. SMC and IOReport must not be called
     /// concurrently, but the timer can fire again while a slow read is
@@ -131,10 +163,12 @@ class PowerMonitor: ObservableObject {
     private var interpolatedWh: Double = 0
     private var lastInterpolationTime: Date?
 
-    /// Fixed nominal voltage for mAh→Wh conversion.
-    /// Apple Silicon MacBooks all use 3-cell LiPo (3 × 3.85V = 11.55V nominal).
-    /// This matches Apple's published Wh specs across all models (Air, Pro 14", Pro 16").
-    private static let nominalVoltage: Double = 11_550.0 // mV
+    /// Fallback nominal pack voltage for mAh→Wh conversion when the cell
+    /// configuration can't be read from the registry. Apple Silicon
+    /// MacBooks use 3-cell LiPo (3 × 3.85V = 11.55V nominal), matching
+    /// Apple's published Wh specs. The preferred source is the snapshot's
+    /// nominalPackVoltageMV, derived from the physical CellVoltage count.
+    private static let fallbackNominalVoltageMV: Double = 11_550.0
 
     // MARK: - Init
 
@@ -219,8 +253,13 @@ class PowerMonitor: ObservableObject {
             isFirstReading = false
             wasCharging = nowCharging
             wattageHistory.removeAll()
+            dischargePowerHistory.removeAll()
             componentSmoothed.removeAll()
             lastIOReportBreakdown = nil
+            smoothedGapW = nil
+            windowSystemSum = 0
+            windowScreenSum = 0
+            windowSampleCount = 0
         } else {
             wattage += smoothingAlpha * (rawSystem - wattage)
             dcInWattage += smoothingAlpha * (rawDcIn - dcInWattage)
@@ -232,15 +271,44 @@ class PowerMonitor: ObservableObject {
             wattageHistory.removeFirst()
         }
 
-        // Update IOReport breakdown when new data arrives
+        // Accumulate raw PSTR/screen between IOReport samples for the
+        // time-aligned gap computation below.
+        if ioReportReader != nil {
+            windowSystemSum += rawSystem
+            windowScreenSum += rawScreen
+            windowSampleCount += 1
+            // If IOReport stops delivering, don't let a stale window grow
+            if windowSampleCount > 100 {
+                windowSystemSum = 0
+                windowScreenSum = 0
+                windowSampleCount = 0
+            }
+        }
+
         if let io = ioBreakdown {
             if lastIOReportBreakdown == nil {
-                // While IOReport was missing the residual was labeled
-                // "Other" and covered the whole SoC — drop that EMA so a
-                // later per-port residual doesn't inherit its magnitude.
-                componentSmoothed.removeValue(forKey: "Other")
+                // The gap was tracking (system − screen) with no SoC
+                // metering; restart it now that IOReport data exists.
+                smoothedGapW = nil
             }
+            if windowSampleCount > 0 {
+                let avgSystem = windowSystemSum / Double(windowSampleCount)
+                let avgScreen = windowScreenSum / Double(windowSampleCount)
+                // Signed gap over the same window the IOReport delta covers.
+                let gap = avgSystem - avgScreen - io.totalMeteredWatts
+                let prev = smoothedGapW ?? gap
+                smoothedGapW = prev + Self.gapSmoothingAlpha * (gap - prev)
+            }
+            windowSystemSum = 0
+            windowScreenSum = 0
+            windowSampleCount = 0
             lastIOReportBreakdown = io
+        } else if lastIOReportBreakdown == nil {
+            // No SoC metering at all: the unmetered remainder is simply
+            // system minus screen — trivially aligned, same tick.
+            let gap = rawSystem - rawScreen
+            let prev = smoothedGapW ?? gap
+            smoothedGapW = prev + 0.05 * (gap - prev)
         }
 
         // Update battery snapshot and per-port USB power before building
@@ -248,10 +316,83 @@ class PowerMonitor: ObservableObject {
         if let snap = batterySnap {
             battery = snap
             usbPortPower = snap.usbPortPower
+            if let batteryW = snap.batteryPowerW, batteryW < -0.05 {
+                dischargePowerHistory.append(-batteryW)
+                if dischargePowerHistory.count > Self.dischargeHistorySize {
+                    dischargePowerHistory.removeFirst()
+                }
+            }
         }
 
         // Build component breakdown
         powerBreakdown = buildBreakdown(rawScreen: rawScreen)
+
+        // Periodic full-state record for offline calibration
+        diagLogCounter = (diagLogCounter + 1) % Self.diagLogInterval
+        if diagLogCounter == 0 {
+            logDiagnostics(
+                rawSystem: rawSystem,
+                rawDcIn: rawDcIn,
+                rawScreen: rawScreen,
+                ioBreakdown: ioBreakdown
+            )
+        }
+    }
+
+    /// Write one diagnostics record: raw SMC values, the latest IOReport
+    /// per-channel watts, the full battery property table, and the app's
+    /// derived values — everything needed to fit calibration offline.
+    private func logDiagnostics(
+        rawSystem: Double,
+        rawDcIn: Double,
+        rawScreen: Double,
+        ioBreakdown: IOReportPowerBreakdown?
+    ) {
+        guard DiagnosticsLogger.shared.isEnabled else { return }
+
+        var record: [String: Any] = [
+            "uptime": ProcessInfo.processInfo.systemUptime,
+            "smc": ["PSTR": rawSystem, "PDTR": rawDcIn, "PDBR": rawScreen],
+        ]
+
+        var derived: [String: Any] = [
+            "wattageEMA": wattage,
+            "dcInEMA": dcInWattage,
+            "gapW": smoothedGapW ?? 0,
+            "avgW5m": averageWattage,
+        ]
+        if let avgDischarge = averageDischargeWatts {
+            derived["avgDischargeW5m"] = avgDischarge
+        }
+        if let cap = interpolatedCapacity() {
+            derived["interpWh"] = cap.currentWh
+            derived["interpMaxWh"] = cap.maxWh
+        }
+        record["derived"] = derived
+
+        if let io = ioBreakdown ?? lastIOReportBreakdown {
+            var ioDict: [String: Any] = [
+                "cpu": io.cpuWatts,
+                "gpu": io.gpuComputeWatts,
+                "gpuSram": io.gpuSRAMWatts,
+                "ane": io.aneWatts,
+                "dram": io.dramWatts,
+                "total": io.totalMeteredWatts,
+            ]
+            for comp in io.otherComponents {
+                ioDict["o_" + comp.label] = comp.watts
+            }
+            record["ioreport"] = ioDict
+        }
+
+        // The complete AppleSmartBattery property table: raw + user-facing
+        // capacities, PowerTelemetryData, BatteryData, ChargerData,
+        // AdapterDetails, CellVoltage, PowerOutDetails, ...
+        if let bat = battery {
+            record["battery"] = bat.rawProperties
+        }
+
+        DiagnosticsLogger.shared.log(record)
     }
 
     private func buildBreakdown(rawScreen: Double) -> [PowerComponent] {
@@ -288,13 +429,14 @@ class PowerMonitor: ObservableObject {
         components.append(smoothedComponent("Screen", raw: rawScreen))
 
         // USB/External power: prefer per-port hardware measurement,
-        // fall back to PSTR-gap calculation.
+        // fall back to the time-aligned PSTR gap (maintained in
+        // applyReadings — raw PSTR/screen averaged over the exact window
+        // each IOReport delta covers, then EMA'd, sign preserved).
         //
         // PowerOutDetails (when available) gives actual measured milliwatts
         // per USB-C port from the PD controller hardware. When unavailable,
-        // the PSTR gap (total system minus metered SoC minus screen) captures
+        // the gap (total system minus metered SoC minus screen) captures
         // the same power — it's a hardware measurement too, just aggregated.
-        let meteredTotal = components.reduce(0.0) { $0 + $1.watts }
         if !usbPortPower.isEmpty {
             // Per-port data available from PowerOutDetails
             for port in usbPortPower {
@@ -302,25 +444,18 @@ class PowerMonitor: ObservableObject {
             }
             // Still show residual for anything not captured by PD (e.g. VRM losses)
             let pdTotal = usbPortPower.reduce(0.0) { $0 + $1.watts }
-            let residual = max(0, wattage - meteredTotal - pdTotal)
+            let residual = (smoothedGapW ?? 0) - pdTotal
             if residual > 0.1 {
-                components.append(smoothedComponent("Other", raw: residual))
+                components.append(PowerComponent(label: "Other", watts: residual))
             }
         } else {
-            // Fallback: PSTR gap method — all external power lumped together.
             // Only call the gap "USB/Ext" when IOReport is metering the SoC;
             // without IOReport the gap is mostly the SoC itself, so labeling
             // it USB would be misleading — call it "Other".
             let residualLabel = lastIOReportBreakdown != nil ? "USB/Ext" : "Other"
-            // Use much heavier smoothing (alpha=0.05) to filter out noise from
-            // timing mismatches between PSTR and IOReport sampling rates.
-            let unmetered = max(0, wattage - meteredTotal)
-            let prev = componentSmoothed[residualLabel] ?? unmetered
-            let smoothed = prev + 0.05 * (unmetered - prev)
+            let gap = smoothedGapW ?? 0
             // Floor small values to zero to avoid jitter around 0
-            let display = smoothed < 0.5 ? 0.0 : smoothed
-            componentSmoothed[residualLabel] = smoothed
-            components.append(PowerComponent(label: residualLabel, watts: display))
+            components.append(PowerComponent(label: residualLabel, watts: gap < 0.5 ? 0.0 : gap))
         }
 
         return components
@@ -394,8 +529,8 @@ class PowerMonitor: ObservableObject {
 
     private func onUsbDeviceChanged() {
         // Reset USB smoothing so it converges fast on the new value —
-        // both the aggregate gap row and any per-port rows.
-        componentSmoothed.removeValue(forKey: "USB/Ext")
+        // both the aggregate gap and any per-port rows.
+        smoothedGapW = nil
         let portKeys = componentSmoothed.keys.filter { $0.hasPrefix("USB Port ") }
         for key in portKeys {
             componentSmoothed.removeValue(forKey: key)
@@ -411,7 +546,8 @@ class PowerMonitor: ObservableObject {
     func interpolatedCapacity() -> (currentWh: Double, maxWh: Double)? {
         guard let bat = battery, bat.maxCapacityMAh > 0 else { return nil }
 
-        let maxWh = Double(bat.maxCapacityMAh) * Self.nominalVoltage / 1_000_000.0
+        let nominalMV = bat.nominalPackVoltageMV ?? Self.fallbackNominalVoltageMV
+        let maxWh = Double(bat.maxCapacityMAh) * nominalMV / 1_000_000.0
         // Derive currentWh from macOS SoC% so they're always consistent.
         // AppleRawCurrentCapacity/AppleRawMaxCapacity doesn't match CurrentCapacity%
         // because Apple uses non-linear curves, temp compensation, and calibration.
@@ -432,14 +568,25 @@ class PowerMonitor: ObservableObject {
             return (socCurrentWh, maxWh)
         }
 
-        let dtHours = now.timeIntervalSince(prevTime) / 3600.0
+        let dt = now.timeIntervalSince(prevTime)
         lastInterpolationTime = now
 
-        if let batteryW = bat.batteryPowerW {
+        // A long gap (sleep) means the last power reading is stale —
+        // integrating it across the gap would be wrong. Re-anchor.
+        guard dt < 60 else {
+            interpolatedWh = socCurrentWh
+            return (socCurrentWh, maxWh)
+        }
+        let dtHours = dt / 3600.0
+
+        if let batteryW = bat.instantBatteryPowerW ?? bat.batteryPowerW {
             // Gas gauge measurement (signed): the actual energy flow into
-            // or out of the battery. Correctly stays flat when the charger
-            // holds the battery (full, or charge limiting), and follows
-            // real drain when the system outdraws the charger.
+            // or out of the battery. Instantaneous amperage tracks rate
+            // changes fastest; its noise integrates out and the SoC band
+            // clamp below bounds any residual error. Correctly stays flat
+            // when the charger holds the battery (full, or charge
+            // limiting), and follows real drain when the system outdraws
+            // the charger.
             interpolatedWh += batteryW * dtHours
         } else if isCharging {
             // Estimate fallback: net charge rate, only move up

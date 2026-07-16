@@ -37,9 +37,10 @@ open dist/WattSec.app
 </p>
 
 - **Detail** - The number of watt decimal places to show (0, 1, or 2)
-- **Pace** - The refresh interval (1s, 3s, or 5s)
+- **Smoothing** - Toggle smoothing of displayed values (On = smoothed, Off = raw)
 - **Width** - The width of the metric in the menu bar (Dynamic or Fixed)
 - **Launch** - Toggle Launch at Login
+- **Diagnostics** - Toggle value logging to `~/Library/Logs/WattSec/` (JSONL, used for calibrating the displayed values against raw hardware telemetry; see `docs/CALIBRATION.md`)
 
 ## Credit
 

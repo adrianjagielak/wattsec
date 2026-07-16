@@ -2,7 +2,27 @@
 //  BatteryInfo.swift
 //  WattSec
 //
-//  Created by Claude on 4/3/26.
+//  Reads the AppleSmartBattery IORegistry entry — the battery gas gauge.
+//
+//  Capacity keys on Apple Silicon (cross-checked against coconutBattery
+//  behavior and apple-oss-distributions/PowerManagement):
+//    - CurrentCapacity / MaxCapacity: PERCENT (user-facing SoC; MaxCapacity
+//      is always 100). Never treat these as mAh.
+//    - AppleRawCurrentCapacity / AppleRawMaxCapacity: gas gauge mAh.
+//      AppleRawMaxCapacity is the full-charge capacity (FCC).
+//    - NominalChargeCapacity: health-adjusted capacity in mAh — the value
+//      coconutBattery reports as "Full Charge Capacity" on Apple Silicon.
+//      Used as fallback when AppleRawMaxCapacity is absent.
+//    - DesignCapacity: factory mAh.
+//  The user-facing percent is intentionally massaged by macOS (pinned near
+//  full, reserve near empty, hysteresis), so percent-derived and raw-derived
+//  values disagree by design. Both are captured in the diagnostics log so
+//  the real mapping can be fitted from recorded data.
+//
+//  PowerTelemetryData (macOS 13+) carries hardware-measured telemetry in mW
+//  (SystemLoad, SystemPowerIn, BatteryPower). Captured for calibration and
+//  exposed read-only; display code keeps using SMC/gauge values until the
+//  telemetry's sign/scale is confirmed from logged data.
 //
 
 import Foundation
@@ -26,33 +46,71 @@ struct UsbPortPower {
 }
 
 struct BatterySnapshot {
-    let currentCapacityMAh: Int    // AppleRawCurrentCapacity
-    let maxCapacityMAh: Int        // AppleRawMaxCapacity
+    let currentCapacityMAh: Int    // AppleRawCurrentCapacity (0 if unavailable)
+    let maxCapacityMAh: Int        // AppleRawMaxCapacity → NominalChargeCapacity (0 if unavailable)
     let designCapacityMAh: Int     // DesignCapacity
-    let socPercent: Int            // CurrentCapacity (macOS's own 0-100%)
+    let socPercent: Int            // CurrentCapacity (macOS's user-facing 0-100%)
     let voltageMV: Int             // Voltage in mV
-    let amperageMA: Int?           // Amperage in mA: + charging, − discharging
+    let amperageMA: Int?           // Amperage (averaged) in mA: + charging, − discharging
+    let instantAmperageMA: Int?    // InstantAmperage in mA (point sample, tracks changes faster)
+    let cellCount: Int?            // Series cell count (from CellVoltage array)
     let cycleCount: Int
     let isCharging: Bool
     let isPluggedIn: Bool
+    let fullyCharged: Bool         // FullyCharged flag from the gauge
     let temperatureC: Double       // Temperature / 100
     let timeToEmpty: Int           // minutes, -1 if unknown
     let timeToFull: Int            // minutes, -1 if unknown
     let usbPortPower: [UsbPortPower]  // Per-port USB-C power delivery
+
+    // PowerTelemetryData (macOS 13+), assumed mW → W. Log/cross-check only
+    // until the recorded data confirms sign and scale on real hardware.
+    let telemetrySystemLoadW: Double?
+    let telemetrySystemPowerInW: Double?
+    let telemetryBatteryPowerW: Double?
+
+    /// The complete raw AppleSmartBattery property table for diagnostics
+    /// logging. Not used for display.
+    let rawProperties: [String: Any]
 
     /// Total USB power delivery across all ports
     var totalUsbPowerWatts: Double {
         usbPortPower.reduce(0) { $0 + $1.watts }
     }
 
-    /// Measured battery charge/discharge power from the gas gauge (W).
+    /// Averaged battery charge/discharge power from the gas gauge (W).
     /// Positive while charging, negative while discharging, ~0 when the
-    /// battery is full or charging is on hold. This is the ground truth
-    /// for energy actually entering/leaving the battery — unlike
-    /// PDTR − PSTR, it excludes charger conversion losses.
+    /// battery is full or charging is on hold. Unlike PDTR − PSTR this is
+    /// the energy actually entering/leaving the battery — it already
+    /// includes charger conversion losses.
     var batteryPowerW: Double? {
         guard let amperageMA = amperageMA else { return nil }
         return Double(amperageMA) * Double(voltageMV) / 1_000_000.0
+    }
+
+    /// Instantaneous battery power (W) — same convention as batteryPowerW
+    /// but from a point sample: noisier, tracks rate changes fastest.
+    var instantBatteryPowerW: Double? {
+        guard let instantAmperageMA = instantAmperageMA else { return nil }
+        return Double(instantAmperageMA) * Double(voltageMV) / 1_000_000.0
+    }
+
+    /// Nominal pack voltage in mV from the physical series cell count
+    /// (3.85 V/cell Li-polymer nominal — matches Apple's published Wh specs).
+    /// Falls back to estimating the cell count from the live pack voltage.
+    /// Used for the mAh→Wh scale so it doesn't wobble with load/charge.
+    var nominalPackVoltageMV: Double? {
+        let perCellNominal = 3850.0
+        if let cells = cellCount, cells > 0 {
+            let perCell = Double(voltageMV) / Double(cells)
+            // Sanity: a real Li-ion cell sits between ~3.0 and ~4.6 V
+            if voltageMV == 0 || (perCell >= 3000 && perCell <= 4600) {
+                return Double(cells) * perCellNominal
+            }
+        }
+        guard voltageMV > 0 else { return nil }
+        let estimatedCells = max(1, Int((Double(voltageMV) / perCellNominal).rounded()))
+        return Double(estimatedCells) * perCellNominal
     }
 
     /// Battery health percentage
@@ -73,27 +131,56 @@ class BatteryInfo {
         guard service != 0 else { return nil }
         defer { IOObjectRelease(service) }
 
-        func prop<T>(_ key: String) -> T? {
-            IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?
-                .takeRetainedValue() as? T
-        }
+        // Fetch the whole property table in one call — cheaper than per-key
+        // lookups, and the diagnostics logger records it verbatim.
+        var propsRef: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &propsRef, kCFAllocatorDefault, 0) == kIOReturnSuccess,
+              let props = propsRef?.takeRetainedValue() as? [String: Any]
+        else { return nil }
 
+        func prop<T>(_ key: String) -> T? { props[key] as? T }
+
+        // Max capacity in mAh. On Apple Silicon "MaxCapacity" is a PERCENT
+        // (always 100) — using it as mAh is how a "1.2 Wh battery" happens.
+        // Reject anything percent-scale and fall through the real-mAh chain.
+        func plausibleMAh(_ value: Int?) -> Int? {
+            guard let value = value, value > 500 else { return nil }
+            return value
+        }
+        let maxCap = plausibleMAh(prop("AppleRawMaxCapacity"))
+            ?? plausibleMAh(prop("NominalChargeCapacity"))
+            ?? 0
+        let designCap = plausibleMAh(prop("DesignCapacity")) ?? maxCap
         let currentCap: Int = prop("AppleRawCurrentCapacity") ?? 0
-        let maxCap: Int = prop("AppleRawMaxCapacity") ?? prop("MaxCapacity") ?? 0
-        let designCap: Int = prop("DesignCapacity") ?? maxCap
+
         let socPct: Int = prop("CurrentCapacity") ?? 0
         let voltage: Int = prop("Voltage") ?? 0
         let cycles: Int = prop("CycleCount") ?? 0
         let charging: Bool = prop("IsCharging") ?? false
         let pluggedIn: Bool = prop("ExternalConnected") ?? false
+        let fullyCharged: Bool = prop("FullyCharged") ?? false
         let tempRaw: Int = prop("Temperature") ?? 0
 
-        // Amperage: signed mA, positive while charging. Some firmware exposes
-        // it as an unsigned container holding a 32-bit two's complement value.
-        var amperage: Int? = prop("Amperage")
-        if let raw = amperage, raw > Int(Int32.max) {
-            amperage = raw - (Int(UInt32.max) + 1)
+        // Amperage (averaged) and InstantAmperage: signed mA, positive while
+        // charging. Some firmware exposes them as an unsigned container
+        // holding a 32-bit two's complement value — normalize that.
+        func signedMilliamps(_ key: String) -> Int? {
+            guard var value: Int = prop(key) else { return nil }
+            if value > Int(Int32.max) {
+                value -= Int(UInt32.max) + 1
+            }
+            return value
         }
+        let amperage = signedMilliamps("Amperage")
+        let instantAmperage = signedMilliamps("InstantAmperage")
+
+        // Physical series cell count — CellVoltage has one entry per cell
+        // group, which pins down the pack's nominal voltage exactly.
+        let cellCount: Int? = {
+            guard let volts: [Int] = prop("CellVoltage") else { return nil }
+            let n = volts.filter { $0 > 0 }.count
+            return n > 0 ? n : nil
+        }()
 
         // IOKit reports 65535 (0xFFFF) for "unknown / still calculating".
         // Without this check the UI shows "Time Left 1092:15".
@@ -103,6 +190,19 @@ class BatteryInfo {
         }
         let tte = estimateMinutes("AvgTimeToEmpty")
         let ttf = estimateMinutes("AvgTimeToFull")
+
+        // PowerTelemetryData (macOS 13+): hardware-measured mW telemetry.
+        var telemetrySystemLoadW: Double? = nil
+        var telemetrySystemPowerInW: Double? = nil
+        var telemetryBatteryPowerW: Double? = nil
+        if let telemetry: [String: Any] = prop("PowerTelemetryData") {
+            func milliwatts(_ key: String) -> Double? {
+                (telemetry[key] as? Int).map { Double($0) / 1000.0 }
+            }
+            telemetrySystemLoadW = milliwatts("SystemLoad")
+            telemetrySystemPowerInW = milliwatts("SystemPowerIn")
+            telemetryBatteryPowerW = milliwatts("BatteryPower")
+        }
 
         // Per-port USB-C power delivery (actual measured milliwatts from PD controller).
         // PowerOutDetails is an undocumented property that provides hardware-measured
@@ -128,7 +228,7 @@ class BatteryInfo {
                     usbPorts.append(UsbPortPower(
                         portIndex: portIndex,
                         watts: Double(mw) / 1000.0,
-                        locationID: UInt32(locationID)
+                        locationID: UInt32(truncatingIfNeeded: locationID)
                     ))
                 }
             }
@@ -141,13 +241,20 @@ class BatteryInfo {
             socPercent: socPct,
             voltageMV: voltage,
             amperageMA: amperage,
+            instantAmperageMA: instantAmperage,
+            cellCount: cellCount,
             cycleCount: cycles,
             isCharging: charging,
             isPluggedIn: pluggedIn,
+            fullyCharged: fullyCharged,
             temperatureC: Double(tempRaw) / 100.0,
             timeToEmpty: tte,
             timeToFull: ttf,
-            usbPortPower: usbPorts
+            usbPortPower: usbPorts,
+            telemetrySystemLoadW: telemetrySystemLoadW,
+            telemetrySystemPowerInW: telemetrySystemPowerInW,
+            telemetryBatteryPowerW: telemetryBatteryPowerW,
+            rawProperties: props
         )
     }
 }

@@ -236,6 +236,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(createWidthModeItem())
         menu.addItem(NSMenuItem.separator())
         menu.addItem(createLaunchAtLoginMenuItem())
+        menu.addItem(createDiagnosticsMenuItem())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
     }
@@ -284,6 +285,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return menuItem
     }
     
+    private func createDiagnosticsMenuItem() -> NSMenuItem {
+        let menuItem = NSMenuItem(title: "Diagnostics", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+
+        let logItem = NSMenuItem(title: "Log Values", action: #selector(toggleDiagnosticsLogging), keyEquivalent: "")
+        logItem.target = self
+        logItem.state = DiagnosticsLogger.shared.isEnabled ? .on : .off
+        submenu.addItem(logItem)
+
+        let showItem = NSMenuItem(title: "Show Log Files", action: #selector(showDiagnosticsLogs), keyEquivalent: "")
+        showItem.target = self
+        submenu.addItem(showItem)
+
+        menuItem.submenu = submenu
+        return menuItem
+    }
+
+    @objc private func toggleDiagnosticsLogging(sender: NSMenuItem) {
+        DiagnosticsLogger.shared.isEnabled.toggle()
+        sender.state = DiagnosticsLogger.shared.isEnabled ? .on : .off
+    }
+
+    @objc private func showDiagnosticsLogs() {
+        // Make sure the folder exists so Finder has something to show
+        try? FileManager.default.createDirectory(
+            at: DiagnosticsLogger.logDirectory, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([DiagnosticsLogger.logDirectory])
+    }
+
     private func createLaunchAtLoginMenuItem() -> NSMenuItem {
         let menuItem = NSMenuItem(title: "Launch", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
@@ -386,7 +416,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // always agrees with the displayed percentage and capacity.
         guard let cap = monitor.interpolatedCapacity() else { return "--:--" }
 
-        let avgPower = monitor.averageWattage
+        // Prefer the measured battery drain (gas gauge) — it includes the
+        // conversion losses between battery and system rail that PSTR
+        // misses, so it's the true rate the battery Wh is falling at.
+        let avgPower = monitor.averageDischargeWatts ?? monitor.averageWattage
         guard avgPower > 0.5 else { return "--:--" }
 
         // Remaining Wh until 10% SoC
@@ -446,7 +479,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Prefer the gas gauge's measured battery power over the
             // DC-in-minus-system estimate, which includes charger
             // conversion losses and reads nonzero on a full battery.
-            let batteryW = monitor.battery?.batteryPowerW
+            let batteryW = monitor.battery.flatMap { $0.batteryPowerW ?? $0.instantBatteryPowerW }
                 ?? (monitor.dcInWattage - monitor.wattage)
             if batteryW >= 0 {
                 powerNetItem?.title = "To Battery    " + String(format: fmt, batteryW)

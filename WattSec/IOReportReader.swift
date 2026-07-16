@@ -101,7 +101,8 @@ final class IOReportReader {
     private var subscription: UnsafeMutableRawPointer?
     private var subscribedChannels: CFMutableDictionary?
     private var previousSample: CFDictionary?
-    private var previousTimestamp: Date?
+    private var previousUptime: TimeInterval?
+    private var previousWallClock: Date?
 
     /// Whether IOReport was successfully loaded and subscribed
     var isAvailable: Bool { subscription != nil }
@@ -180,23 +181,30 @@ final class IOReportReader {
 
         guard let sampleRef = fnCreateSamples(sub, channels, nil) else { return nil }
         let currentSample = sampleRef.takeRetainedValue()
-        let now = Date()
+        // Awake-time is the correct denominator for energy/time: the energy
+        // counters only accumulate while the SoC is awake, and unlike
+        // Date() a monotonic clock can't jump with NTP/clock adjustments.
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let nowWall = Date()
 
         defer {
             previousSample = currentSample
-            previousTimestamp = now
+            previousUptime = nowUptime
+            previousWallClock = nowWall
         }
 
-        guard let prev = previousSample, let prevTime = previousTimestamp else {
+        guard let prev = previousSample,
+              let prevUptime = previousUptime,
+              let prevWall = previousWallClock else {
             return nil // First call — establishing baseline
         }
 
-        let elapsed = now.timeIntervalSince(prevTime)
+        let elapsed = nowUptime - prevUptime
         guard elapsed > 0.01 else { return nil } // Too short for meaningful delta
-        // A long gap means the baseline is stale (system slept, sampling
-        // paused): the delta would be diluted across wall-clock time the
-        // counters weren't running. Drop it and re-baseline (defer above).
-        guard elapsed < 30 else { return nil }
+        // Across a sleep the counters may reset, and dark-wake energy piles
+        // into a small awake window — drop the sample and re-baseline
+        // (the defer above already advanced the baseline).
+        guard nowWall.timeIntervalSince(prevWall) < 30 else { return nil }
 
         guard let deltaRef = fnCreateSamplesDelta(prev, currentSample, nil) else {
             return nil

@@ -1,0 +1,79 @@
+# Value calibration workflow
+
+WattSec displays numbers assembled from several independent hardware sources
+that don't perfectly agree (different sensors, units, update rates, and
+intentional massaging by macOS). To make the displayed values converge on
+physical truth, the app records everything it reads and we fit calibration
+offline from days of real-world data.
+
+## The loop
+
+1. Run the app normally for a few days with **Diagnostics → Log Values** on
+   (default). Include a few full charge and discharge cycles, some idle time,
+   some heavy load, USB devices plugged/unplugged, and at least one session
+   from 100% down below 10% if practical.
+2. Collect `~/Library/Logs/WattSec/wattsec-*.jsonl` (one file per UTC day,
+   one JSON object per line, every ~5 s, ~20–40 MB/day, auto-pruned after
+   14 days).
+3. Analyze the data (see below), derive constants/curves, fold them into the
+   app, and repeat until the residuals stop improving (expected: 1–3 rounds).
+
+## Record format
+
+Each line has:
+
+| Field | Contents |
+|---|---|
+| `ts` | ISO 8601 wall-clock timestamp |
+| `uptime` | seconds awake since boot (monotonic; pauses during sleep) |
+| `smc` | raw SMC watts: `PSTR` (system total), `PDTR` (DC in), `PDBR` (screen) |
+| `ioreport` | per-channel SoC watts from Energy Model counters: `cpu`, `gpu`, `gpuSram`, `ane`, `dram`, `total`, plus `o_<label>` for every other channel |
+| `battery` | the **complete** AppleSmartBattery property table (binary blobs stripped) |
+| `derived` | what the app computed: `wattageEMA`, `dcInEMA`, `gapW` (time-aligned unmetered gap), `avgW5m`, `avgDischargeW5m`, `interpWh`, `interpMaxWh` |
+
+Interesting `battery` keys captured for calibration:
+
+- `AppleRawCurrentCapacity`, `AppleRawMaxCapacity`, `NominalChargeCapacity`,
+  `DesignCapacity` (all mAh) vs `CurrentCapacity` (user-facing %; **not**
+  linear — macOS pins it near full and reserves near empty)
+- `Voltage`, `Amperage`, `InstantAmperage`, `CellVoltage` (per-cell mV)
+- `PowerTelemetryData` (macOS 13+): `SystemLoad`, `SystemPowerIn`,
+  `BatteryPower`, and adapter fields — hardware-measured mW telemetry
+- `ChargerData` (charging voltage/current, not-charging reason),
+  `AdapterDetails`, `PowerOutDetails` (per-USB-port mW), `Temperature`,
+  `FullyCharged`, `IsCharging`, `ExternalConnected`
+
+## Planned analyses
+
+1. **User-facing % ↔ raw capacity mapping.** Regress `CurrentCapacity`
+   against `AppleRawCurrentCapacity / AppleRawMaxCapacity` across full
+   cycles. Expect pinning at 100%, a reserve offset near 0%, and hysteresis
+   between charge and discharge. Output: a piecewise curve so displayed Wh
+   can use raw gauge data while still matching the menu-bar %.
+2. **True Wh scale.** Integrate measured battery power
+   (`Voltage × Amperage`) over full discharge segments and compare with
+   `AppleRawMaxCapacity × nominal V` and the spec sheet Wh. Output: the
+   correct nominal-voltage constant (or an SoC-dependent voltage curve)
+   instead of the assumed 3.85 V/cell.
+3. **Charger efficiency.** On AC: `PDTR − PSTR − BatteryPower(charging)`
+   gives conversion loss; fit loss vs load to get the efficiency curve used
+   by the "To Battery" estimate fallback.
+4. **PSTR cross-check.** Compare `PSTR` with `PowerTelemetryData.SystemLoad`
+   and, on battery, with `|Voltage × Amperage|`. Output: additive/
+   multiplicative correction for the headline watts, and confirmation of
+   `PowerTelemetryData` units/signs so it can be promoted to a display
+   source.
+5. **Unmetered gap behavior.** Distribution of `gapW` at idle with nothing
+   plugged (should be ≈ VRM losses, a few % of PSTR) vs with USB devices.
+   Output: baseline offset so USB/Ext shows ~0 W when nothing draws power.
+6. **IOReport vs PSTR.** `ioreport.total + PDBR` vs `PSTR` under varied
+   load to quantify what the Energy Model misses.
+
+## Notes
+
+- All fields are logged **raw, before smoothing** (except the explicitly
+  named `derived` values), so filtering choices can be re-made offline.
+- Timestamps are wall-clock; `uptime` disambiguates sleep gaps (wall time
+  advances, uptime doesn't).
+- Logging costs one IORegistry dump per 5 s (it reuses the battery snapshot
+  the app already takes) and an async file append — negligible power.
