@@ -75,6 +75,30 @@ Interesting `battery` keys captured for calibration:
 6. **IOReport vs PSTR.** `ioreport.total + PDBR` vs `PSTR` under varied
    load to quantify what the Energy Model misses.
 
+## Round 1 results (2026-07, Mac16,6, macOS 27 beta, ~66h / 237k records)
+
+Ground-truth reference: gauge energy (Voltage×Amperage integrated) and the
+exact energy balance `SystemPowerIn = SystemLoad + BatteryPower` (holds to
+0 mW in PowerTelemetryData).
+
+| Question | Result | Incorporated as |
+|---|---|---|
+| Headline source | `SystemLoad` matches true battery drain ×1.013 over 263 Wh; PSTR ×0.952 average with per-segment 0.79–1.11 scatter | Headline = SystemLoad when fresh, PSTR fallback |
+| PDTR meaning | PDTR = SystemPowerIn (energy ratio 0.990 over 132 Wh) | DC-In row unchanged |
+| %↔raw map | discharge `soc = 1.062·raw% − 1.05` (σ 0.65pp); charge `soc = raw% + 1.07` (σ 0.35pp); 100% pinned over raw 94–100% | Coulomb interpolation slopes 1.062 / 1.0 |
+| Wh scale | current-weighted discharge V = 11.38 V vs 11.55 V nominal; charge V = 12.03 V; discharge V curve 10.76 V (0–10%) → 12.71 V (90–100%) | `dischargeEnergyFactor = 0.985` on time estimates |
+| Battery power sources | `BatteryData.BatteryPower ≡ Voltage×InstantAmperage` (σ 83 mW); `Amperage ≡ InstantAmperage` on this OS; `pt_bp` ≈ 2s average, lag 0 | To-Battery row & drain history unchanged (V×A) |
+| Adapter efficiency | 97.0–97.7% above 10 W (`AdapterEfficiencyLoss` measured; `IPDInputPower` is a configured limit, NOT a measurement) | "Adapter Loss" row from telemetry |
+| IOReport Energy Model | broken on macOS 27/M4: `cpu` updates minutes apart (nonzero in 0.85% of 1s deltas), random multi-kW spikes not tied to wake, ≤14% coverage even with 300s windows | 60s rolling energy window + 500 W/channel spike rejection + coverage watchdog that degrades the breakdown below 30% coverage |
+| Capacity keys | `AppleRaw*`/`NominalChargeCapacity`/`DesignCapacity`/`CellVoltage`/`Temperature` absent from top level on macOS 27; gauge lives in `BatteryData.{RemainingCapacity, FullChargeCapacity, …}`; the app's interpolated Wh never ran all week because of this | BatteryData fallback chain; temp row hidden at 0 |
+| Sanity checks | design 6249 mAh × 11.55 V = 72.2 Wh ≈ 72.4 Wh spec; FCC 5882 → health 94%; coulomb counter vs Δremaining agrees ~±10% per segment | — |
+
+Open for round 2: verify SystemLoad headline behavior on AC vs the old
+PSTR feel, confirm the coulomb interpolation's sub-percent smoothness,
+collect `NotChargingReason` bit meanings (values seen: 128, 0x1000000,
+0x1000080, 0x400081…), and re-measure IOReport coverage with the window
+in place.
+
 ## Notes
 
 - All fields are logged **raw, before smoothing** (except the explicitly

@@ -4,25 +4,32 @@
 //
 //  Reads the AppleSmartBattery IORegistry entry — the battery gas gauge.
 //
-//  Capacity keys on Apple Silicon (cross-checked against coconutBattery
-//  behavior and apple-oss-distributions/PowerManagement):
+//  Capacity keys on Apple Silicon:
 //    - CurrentCapacity / MaxCapacity: PERCENT (user-facing SoC; MaxCapacity
 //      is always 100). Never treat these as mAh.
-//    - AppleRawCurrentCapacity / AppleRawMaxCapacity: gas gauge mAh.
-//      AppleRawMaxCapacity is the full-charge capacity (FCC).
-//    - NominalChargeCapacity: health-adjusted capacity in mAh — the value
-//      coconutBattery reports as "Full Charge Capacity" on Apple Silicon.
-//      Used as fallback when AppleRawMaxCapacity is absent.
-//    - DesignCapacity: factory mAh.
-//  The user-facing percent is intentionally massaged by macOS (pinned near
-//  full, reserve near empty, hysteresis), so percent-derived and raw-derived
-//  values disagree by design. Both are captured in the diagnostics log so
-//  the real mapping can be fitted from recorded data.
+//    - AppleRawCurrentCapacity / AppleRawMaxCapacity: gas gauge mAh —
+//      present on macOS ≤ 26; REMOVED from the top level on macOS 27.
+//    - BatteryData.{RemainingCapacity, FullChargeCapacity,
+//      NominalChargeCapacity, DesignCapacity}: the same gauge values on
+//      macOS 27+ (verified against 7 days of logged registry dumps on
+//      Mac16,6 / macOS 27 beta).
+//  The user-facing percent is intentionally massaged by macOS. Fitted from
+//  ~66h of logged data (docs/CALIBRATION.md):
+//      discharge: displayed% ≈ 1.062×raw% − 1.05   (residual σ 0.65pp)
+//      charge:    displayed% ≈ raw% + 1.07         (residual σ 0.35pp)
+//      100% is pinned while raw% drifts 94..100.
 //
-//  PowerTelemetryData (macOS 13+) carries hardware-measured telemetry in mW
-//  (SystemLoad, SystemPowerIn, BatteryPower). Captured for calibration and
-//  exposed read-only; display code keeps using SMC/gauge values until the
-//  telemetry's sign/scale is confirmed from logged data.
+//  PowerTelemetryData (macOS 13+) is measured mW telemetry and, per the
+//  same logs, the most accurate power source available:
+//    - SystemPowerIn = SystemVoltageIn×SystemCurrentIn exactly; ≈ SMC PDTR
+//      (energy ratio 0.990 over 132 Wh).
+//    - SystemLoad = SystemPowerIn − BatteryPower exactly (energy-balance
+//      residual). On battery it equals true battery drain (energy ratio
+//      1.013 over 263 Wh) while SMC PSTR under-reads by ~5% on average
+//      (down to −21% in some segments). SystemLoad is therefore the
+//      preferred headline source.
+//    - AdapterEfficiencyLoss: measured charger conversion loss
+//      (~3% of SystemPowerIn above 10 W).
 //
 
 import Foundation
@@ -58,16 +65,18 @@ struct BatterySnapshot {
     let isCharging: Bool
     let isPluggedIn: Bool
     let fullyCharged: Bool         // FullyCharged flag from the gauge
-    let temperatureC: Double       // Temperature / 100
+    let notChargingReason: Int     // ChargerData.NotChargingReason (0 = none)
+    let temperatureC: Double       // Temperature / 100 (0 when unavailable)
     let timeToEmpty: Int           // minutes, -1 if unknown
     let timeToFull: Int            // minutes, -1 if unknown
     let usbPortPower: [UsbPortPower]  // Per-port USB-C power delivery
 
-    // PowerTelemetryData (macOS 13+), assumed mW → W. Log/cross-check only
-    // until the recorded data confirms sign and scale on real hardware.
+    // PowerTelemetryData (macOS 13+), mW → W. Units/sign verified against
+    // 7 days of logged data; SystemLoad is the preferred headline source.
     let telemetrySystemLoadW: Double?
     let telemetrySystemPowerInW: Double?
     let telemetryBatteryPowerW: Double?
+    let telemetryAdapterLossW: Double?
 
     /// The complete raw AppleSmartBattery property table for diagnostics
     /// logging. Not used for display.
@@ -139,19 +148,29 @@ class BatteryInfo {
         else { return nil }
 
         func prop<T>(_ key: String) -> T? { props[key] as? T }
+        let batteryData = (props["BatteryData"] as? [String: Any]) ?? [:]
+        func bdProp<T>(_ key: String) -> T? { batteryData[key] as? T }
 
         // Max capacity in mAh. On Apple Silicon "MaxCapacity" is a PERCENT
         // (always 100) — using it as mAh is how a "1.2 Wh battery" happens.
-        // Reject anything percent-scale and fall through the real-mAh chain.
+        // On macOS 27+ the mAh keys moved from the top level into
+        // BatteryData, so both locations are tried. Reject anything
+        // percent-scale.
         func plausibleMAh(_ value: Int?) -> Int? {
             guard let value = value, value > 500 else { return nil }
             return value
         }
         let maxCap = plausibleMAh(prop("AppleRawMaxCapacity"))
+            ?? plausibleMAh(bdProp("FullChargeCapacity"))
             ?? plausibleMAh(prop("NominalChargeCapacity"))
+            ?? plausibleMAh(bdProp("NominalChargeCapacity"))
             ?? 0
-        let designCap = plausibleMAh(prop("DesignCapacity")) ?? maxCap
-        let currentCap: Int = prop("AppleRawCurrentCapacity") ?? 0
+        let designCap = plausibleMAh(prop("DesignCapacity"))
+            ?? plausibleMAh(bdProp("DesignCapacity"))
+            ?? maxCap
+        let currentCap: Int = prop("AppleRawCurrentCapacity")
+            ?? bdProp("RemainingCapacity")
+            ?? 0
 
         let socPct: Int = prop("CurrentCapacity") ?? 0
         let voltage: Int = prop("Voltage") ?? 0
@@ -160,6 +179,8 @@ class BatteryInfo {
         let pluggedIn: Bool = prop("ExternalConnected") ?? false
         let fullyCharged: Bool = prop("FullyCharged") ?? false
         let tempRaw: Int = prop("Temperature") ?? 0
+        let chargerData = (props["ChargerData"] as? [String: Any]) ?? [:]
+        let notChargingReason = chargerData["NotChargingReason"] as? Int ?? 0
 
         // Amperage (averaged) and InstantAmperage: signed mA, positive while
         // charging. Some firmware exposes them as an unsigned container
@@ -195,6 +216,7 @@ class BatteryInfo {
         var telemetrySystemLoadW: Double? = nil
         var telemetrySystemPowerInW: Double? = nil
         var telemetryBatteryPowerW: Double? = nil
+        var telemetryAdapterLossW: Double? = nil
         if let telemetry: [String: Any] = prop("PowerTelemetryData") {
             func milliwatts(_ key: String) -> Double? {
                 (telemetry[key] as? Int).map { Double($0) / 1000.0 }
@@ -202,6 +224,7 @@ class BatteryInfo {
             telemetrySystemLoadW = milliwatts("SystemLoad")
             telemetrySystemPowerInW = milliwatts("SystemPowerIn")
             telemetryBatteryPowerW = milliwatts("BatteryPower")
+            telemetryAdapterLossW = milliwatts("AdapterEfficiencyLoss")
         }
 
         // Per-port USB-C power delivery (actual measured milliwatts from PD controller).
@@ -247,6 +270,7 @@ class BatteryInfo {
             isCharging: charging,
             isPluggedIn: pluggedIn,
             fullyCharged: fullyCharged,
+            notChargingReason: notChargingReason,
             temperatureC: Double(tempRaw) / 100.0,
             timeToEmpty: tte,
             timeToFull: ttf,
@@ -254,6 +278,7 @@ class BatteryInfo {
             telemetrySystemLoadW: telemetrySystemLoadW,
             telemetrySystemPowerInW: telemetrySystemPowerInW,
             telemetryBatteryPowerW: telemetryBatteryPowerW,
+            telemetryAdapterLossW: telemetryAdapterLossW,
             rawProperties: props
         )
     }

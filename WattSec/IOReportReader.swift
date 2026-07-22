@@ -104,6 +104,27 @@ final class IOReportReader {
     private var previousUptime: TimeInterval?
     private var previousWallClock: Date?
 
+    /// One accepted delta: per-category energy in joules over `elapsed`.
+    private struct EnergySample {
+        var cpuJ = 0.0, gpuComputeJ = 0.0, gpuSramJ = 0.0, aneJ = 0.0, dramJ = 0.0
+        var otherJ: [String: Double] = [:]
+        var elapsed: TimeInterval = 0
+        var maxChannelJ: Double = 0
+    }
+
+    /// Rolling window of accepted deltas. Rates are reported as
+    /// (Σ energy / Σ elapsed) over up to `windowSeconds`. Needed because
+    /// some OS/chip combinations publish the Energy Model counters in
+    /// erratic batches (observed on macOS 27 beta / M4: most 1s deltas are
+    /// zero, the energy arriving in lumps minutes apart) — instantaneous
+    /// rates are then meaningless while windowed rates stay correct.
+    private var window: [EnergySample] = []
+    private static let windowSeconds: TimeInterval = 60
+    /// A single delta implying more than this per channel is a counter
+    /// anomaly (resets/jumps produce apparent kW..MW); the delta is
+    /// dropped. No Mac component draws 500 W.
+    private static let maxChannelWatts = 500.0
+
     /// Whether IOReport was successfully loaded and subscribed
     var isAvailable: Bool { subscription != nil }
 
@@ -211,17 +232,60 @@ final class IOReportReader {
         }
         let delta = deltaRef.takeRetainedValue()
 
-        return parseEnergyDelta(delta, elapsed: elapsed)
+        let deltaSample = parseEnergySample(delta, elapsed: elapsed)
+
+        // Counter anomaly (reset/jump): a single delta implying an
+        // impossible rate would poison the whole window — drop it.
+        if deltaSample.maxChannelJ / elapsed > Self.maxChannelWatts {
+            return windowedBreakdown()
+        }
+
+        window.append(deltaSample)
+        var total = window.reduce(0.0) { $0 + $1.elapsed }
+        while window.count > 1, total - window[0].elapsed >= Self.windowSeconds {
+            total -= window.removeFirst().elapsed
+        }
+        return windowedBreakdown()
+    }
+
+    /// Rates over the current window: Σ energy / Σ elapsed per category.
+    private func windowedBreakdown() -> IOReportPowerBreakdown? {
+        let elapsed = window.reduce(0.0) { $0 + $1.elapsed }
+        guard elapsed > 0.5 else { return nil }
+        var cpuJ = 0.0, gpuJ = 0.0, sramJ = 0.0, aneJ = 0.0, dramJ = 0.0
+        var otherJ: [String: Double] = [:]
+        for s in window {
+            cpuJ += s.cpuJ
+            gpuJ += s.gpuComputeJ
+            sramJ += s.gpuSramJ
+            aneJ += s.aneJ
+            dramJ += s.dramJ
+            for (label, joules) in s.otherJ {
+                otherJ[label, default: 0] += joules
+            }
+        }
+        var result = IOReportPowerBreakdown()
+        result.cpuWatts = cpuJ / elapsed
+        result.gpuComputeWatts = gpuJ / elapsed
+        result.gpuSRAMWatts = sramJ / elapsed
+        result.aneWatts = aneJ / elapsed
+        result.dramWatts = dramJ / elapsed
+        result.otherComponents = otherJ
+            .filter { $0.value / elapsed > 0.001 }
+            .map { (label: $0.key, watts: $0.value / elapsed) }
+            .sorted { $0.label < $1.label }
+        return result
     }
 
     // MARK: - Parsing
 
-    private func parseEnergyDelta(_ delta: CFDictionary, elapsed: TimeInterval) -> IOReportPowerBreakdown {
-        var result = IOReportPowerBreakdown()
+    private func parseEnergySample(_ delta: CFDictionary, elapsed: TimeInterval) -> EnergySample {
+        var sample = EnergySample()
+        sample.elapsed = elapsed
 
         guard let dict = delta as? [String: Any],
               let items = dict["IOReportChannels"] as? [Any] else {
-            return result
+            return sample
         }
 
         for case let item as NSDictionary in items {
@@ -237,20 +301,21 @@ final class IOReportReader {
 
             let rawValue = fnGetIntValue(cfItem, 0)
             // Counters can reset (e.g. across sleep/wake) producing a
-            // negative delta — never report negative power.
-            let watts = max(0, energyToWatts(rawValue, unit: unitStr, elapsed: elapsed))
+            // negative delta — never accumulate negative energy.
+            let joules = max(0, energyToJoules(rawValue, unit: unitStr))
+            sample.maxChannelJ = max(sample.maxChannelJ, joules)
 
             // Robust matching handles all chip variants:
             //   Base: ECPU, PCPU, GPU0, GPU SRAM0, ANE0, DRAM0
             //   Pro/Max: EACC_CPU, PACC0_CPU, GPU0, GPU SRAM0, ANE0, DRAM0
             //   Ultra: DIE_0_EACC_CPU, DIE_0_PACC0_CPU, GPU0_0, ANE0_0, DRAM0_0
-            categorize(name: name, watts: watts, into: &result)
+            categorize(name: name, joules: joules, into: &sample)
         }
 
-        return result
+        return sample
     }
 
-    private func categorize(name: String, watts: Double, into result: inout IOReportPowerBreakdown) {
+    private func categorize(name: String, joules: Double, into sample: inout EnergySample) {
         let n = name.uppercased()
 
         // CPU: ECPU, PCPU, *_CPU, *CPU Energy, EACC*, PACC*, *CPUDTL*
@@ -258,33 +323,27 @@ final class IOReportReader {
             || n.hasPrefix("EACC") || n.hasPrefix("PACC")
             || n.hasSuffix("_CPU") || n.hasSuffix("CPU ENERGY")
             || n.contains("CPUDTL") {
-            result.cpuWatts += watts
+            sample.cpuJ += joules
         }
         // GPU SRAM (must check before GPU to avoid false match)
         else if n.hasPrefix("GPU SRAM") || n.hasPrefix("GPU_SRAM") {
-            result.gpuSRAMWatts += watts
+            sample.gpuSramJ += joules
         }
         // GPU compute: GPU0, GPU Energy, GPU0_0
         else if n == "GPU ENERGY" || n.hasPrefix("GPU0") || n == "GPU" {
-            result.gpuComputeWatts += watts
+            sample.gpuComputeJ += joules
         }
         // ANE
         else if n.hasPrefix("ANE") {
-            result.aneWatts += watts
+            sample.aneJ += joules
         }
         // DRAM
         else if n.hasPrefix("DRAM") {
-            result.dramWatts += watts
+            sample.dramJ += joules
         }
-        // Everything else — capture if non-trivial
-        else if watts > 0.001 {
-            let label = humanLabel(for: name)
-            // Merge into existing label if present (e.g. multiple DCS channels)
-            if let idx = result.otherComponents.firstIndex(where: { $0.label == label }) {
-                result.otherComponents[idx].watts += watts
-            } else {
-                result.otherComponents.append((label: label, watts: watts))
-            }
+        // Everything else — merge by human label (e.g. multiple DCS channels)
+        else if joules > 0 {
+            sample.otherJ[humanLabel(for: name), default: 0] += joules
         }
     }
 
@@ -308,14 +367,13 @@ final class IOReportReader {
         }
     }
 
-    /// Convert raw energy delta to watts.
-    private func energyToWatts(_ energy: Int64, unit: String, elapsed: TimeInterval) -> Double {
-        let rate = Double(energy) / elapsed
+    /// Convert a raw energy delta to joules.
+    private func energyToJoules(_ energy: Int64, unit: String) -> Double {
         switch unit {
-        case "mJ": return rate / 1e3
-        case "uJ": return rate / 1e6
-        case "nJ": return rate / 1e9
-        default:   return rate / 1e9 // Fallback: assume nJ (matches missing-label default)
+        case "mJ": return Double(energy) / 1e3
+        case "uJ": return Double(energy) / 1e6
+        case "nJ": return Double(energy) / 1e9
+        default:   return Double(energy) / 1e9 // Fallback: assume nJ (matches missing-label default)
         }
     }
 }

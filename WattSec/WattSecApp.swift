@@ -91,6 +91,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var powerSystemItem: NSMenuItem?
     private var powerDcInItem: NSMenuItem?
     private var powerNetItem: NSMenuItem?
+    private var powerAdapterLossItem: NSMenuItem?
     private var powerBreakdownItems: [NSMenuItem] = []
     private static let maxBreakdownItems = 16
     
@@ -218,6 +219,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         powerNetItem?.isEnabled = false
         powerNetItem?.isHidden = true
         menu.addItem(powerNetItem!)
+
+        powerAdapterLossItem = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+        powerAdapterLossItem?.isEnabled = false
+        powerAdapterLossItem?.isHidden = true
+        menu.addItem(powerAdapterLossItem!)
 
         // Pre-create breakdown item slots
         for _ in 0..<Self.maxBreakdownItems {
@@ -422,8 +428,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let avgPower = monitor.averageDischargeWatts ?? monitor.averageWattage
         guard avgPower > 0.5 else { return "--:--" }
 
-        // Remaining Wh until 10% SoC
-        let remainingWh = cap.currentWh - cap.maxWh * 0.10
+        // Remaining Wh until 10% SoC, corrected for the real discharge
+        // voltage (~1.5% below the nominal display scale — fitted from
+        // logged data, see docs/CALIBRATION.md)
+        let remainingWh = (cap.currentWh - cap.maxWh * 0.10) * PowerMonitor.dischargeEnergyFactor
         guard remainingWh > 0 else { return "0:00" }
 
         let hoursLeft = remainingWh / avgPower
@@ -466,7 +474,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             batteryCyclesItem?.title = "Cycles    \(bat.cycleCount)"
-            batteryTempItem?.title = String(format: "Temp    %.1f\u{00B0}C", bat.temperatureC)
+            // Temperature is unavailable on some OS versions (reads 0)
+            if bat.temperatureC > 1 {
+                batteryTempItem?.title = String(format: "Temp    %.1f\u{00B0}C", bat.temperatureC)
+                batteryTempItem?.isHidden = false
+            } else {
+                batteryTempItem?.isHidden = true
+            }
         }
 
         // Power section — update titles only, never add/remove items
@@ -487,9 +501,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 powerNetItem?.title = "From Battery    " + String(format: fmt, -batteryW)
             }
             powerNetItem?.isHidden = false
+
+            // Measured charger conversion loss (PowerTelemetryData) —
+            // ~3% of DC-in on real hardware; shown when meaningful.
+            if let loss = monitor.battery?.telemetryAdapterLossW, loss > 0.25 {
+                powerAdapterLossItem?.title = "Adapter Loss    " + String(format: fmt, loss)
+                powerAdapterLossItem?.isHidden = false
+            } else {
+                powerAdapterLossItem?.isHidden = true
+            }
         } else {
             powerDcInItem?.isHidden = true
             powerNetItem?.isHidden = true
+            powerAdapterLossItem?.isHidden = true
         }
 
         // Component breakdown — fill pre-created slots
