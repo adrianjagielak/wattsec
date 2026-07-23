@@ -490,11 +490,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if monitor.isCharging {
             powerDcInItem?.title = "DC In    " + String(format: fmt, monitor.dcInWattage)
             powerDcInItem?.isHidden = false
-            // Prefer the gas gauge's measured battery power over the
-            // DC-in-minus-system estimate, which includes charger
-            // conversion losses and reads nonzero on a full battery.
-            let batteryW = monitor.battery.flatMap { $0.batteryPowerW ?? $0.instantBatteryPowerW }
-                ?? (monitor.dcInWattage - monitor.wattage)
+            // Same telemetry snapshot + smoothing as System and DC In, so
+            // the three rows add up (DC In = System + To Battery is an
+            // exact identity in PowerTelemetryData).
+            let batteryW = monitor.batteryFlowWattage
             if batteryW >= 0 {
                 powerNetItem?.title = "To Battery    " + String(format: fmt, batteryW)
             } else {

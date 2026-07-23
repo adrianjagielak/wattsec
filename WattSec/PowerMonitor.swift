@@ -58,8 +58,13 @@ class PowerMonitor: ObservableObject {
     /// logged data), falling back to SMC PSTR (which under-reads by ~5%
     /// on average on newer machines).
     @Published var wattage: Double = 0.0
-    /// Smoothed DC input power (PDTR) — non-zero when charger connected
+    /// Smoothed DC input power — non-zero when charger connected.
+    /// Source: telemetry SystemPowerIn when fresh (same snapshot as the
+    /// system/battery values, so the rows add up), SMC PDTR fallback.
     @Published var dcInWattage: Double = 0.0
+    /// Smoothed battery charge(+)/discharge(−) power. Same telemetry
+    /// snapshot as wattage/dcInWattage when available, gauge V×A fallback.
+    @Published var batteryFlowWattage: Double = 0.0
     /// Latest battery snapshot (updated every ~1 second)
     @Published var battery: BatterySnapshot?
     /// Smoothed power breakdown by component
@@ -170,21 +175,35 @@ class PowerMonitor: ObservableObject {
     /// Gauge coulomb counter (mAh) at the last interpolation step
     private var lastRemainingMAh: Int?
 
-    /// Headline source: latest telemetry SystemLoad (held between ~1s
-    /// battery reads; ignored when stale)
+    /// Latest telemetry values (held between ~1s battery reads; ignored
+    /// when stale). SystemPowerIn = SystemLoad + BatteryPower is an exact
+    /// identity in this telemetry, so sourcing System / DC In / To Battery
+    /// from the same snapshot makes the displayed rows add up exactly —
+    /// mixing time bases (fast SMC vs windowed telemetry) does not.
     private var lastSystemLoadW: Double?
-    private var lastSystemLoadAt: Date?
+    private var lastDcInW: Double?
+    private var lastBatteryFlowW: Double?
+    private var lastTelemetryAt: Date?
 
     /// IOReport reliability watchdog. On some machines (observed on
     /// Mac16,6 / macOS 27) the Energy Model counters update erratically —
     /// minutes apart, with bogus multi-kW spikes — and cover only ~14% of
-    /// SoC power even when windowed. Track windowed coverage vs
-    /// (system − screen) and permanently degrade the breakdown for the
-    /// session once it's clearly bogus.
+    /// SoC power even when windowed. Coverage vs (system − screen) decides
+    /// a verdict that is persisted, so the breakdown is right from the
+    /// first frame on later launches.
     private var ioCoverageIoSum: Double = 0
     private var ioCoverageTargetSum: Double = 0
     private var ioCoverageSamples: Int = 0
-    private(set) var ioReportUnreliable = false
+    /// nil = undetermined (warm-up: rows hidden, residual = whole SoC)
+    private var ioVerdictUnreliable: Bool?
+    /// Per-component IOReport rows are shown only once proven reliable
+    var ioReportTrusted: Bool { ioVerdictUnreliable == false }
+    /// Machine has ever exposed per-port PowerOutDetails (persisted) —
+    /// USB power is measured there, so the gap must never be labeled USB.
+    private var hasSeenPortPower = false
+
+    private static let ioVerdictDefaultsKey = "ioEnergyModelUnreliable"
+    private static let portPowerDefaultsKey = "hasSeenPowerOutDetails"
 
     /// Fallback nominal pack voltage for mAh→Wh conversion when the cell
     /// configuration can't be read from the registry. Apple Silicon
@@ -203,12 +222,13 @@ class PowerMonitor: ObservableObject {
     /// nominal display scale — energy actually deliverable is ~1.5% less
     /// than the nominal-scale Wh suggests. Applied to time estimates only.
     static let dischargeEnergyFactor = 0.985
-    /// Telemetry SystemLoad older than this falls back to PSTR
+    /// Telemetry values older than this fall back to SMC/gauge sources
     private static let systemLoadMaxAge: TimeInterval = 5.0
-    /// Degrade the IOReport breakdown when windowed coverage of
-    /// (system − screen) stays below this after enough samples
-    private static let ioCoverageMinRatio = 0.3
-    private static let ioCoverageMinSamples = 300
+    /// Coverage watchdog: decide after ~1 minute of loaded samples;
+    /// hysteresis so the verdict can flip only on clear evidence
+    private static let ioCoverageMinSamples = 60
+    private static let ioUnreliableBelow = 0.25
+    private static let ioReliableAbove = 0.5
 
     // MARK: - Init
 
@@ -218,6 +238,9 @@ class PowerMonitor: ObservableObject {
         } else {
             print("PowerMonitor: IOReport unavailable — using SMC-only breakdown")
         }
+        // Restore per-machine verdicts so the first frame is already right
+        ioVerdictUnreliable = UserDefaults.standard.object(forKey: Self.ioVerdictDefaultsKey) as? Bool
+        hasSeenPortPower = UserDefaults.standard.bool(forKey: Self.portPowerDefaultsKey)
         setupTimer()
         setupUsbNotifications()
     }
@@ -284,22 +307,34 @@ class PowerMonitor: ObservableObject {
         batterySnap: BatterySnapshot?,
         ioBreakdown: IOReportPowerBreakdown?
     ) {
-        let nowCharging = rawDcIn > Self.chargingThreshold
-
-        // Headline source: telemetry SystemLoad when fresh (energy-balance
-        // measured, matches true battery drain to ~1%), else SMC PSTR.
-        if let loadW = batterySnap?.telemetrySystemLoadW {
-            lastSystemLoadW = loadW
-            lastSystemLoadAt = Date()
+        // Hold the latest telemetry (SystemPowerIn = SystemLoad +
+        // BatteryPower is exact within one snapshot — sourcing all three
+        // displayed values from it makes the menu add up; SMC PDTR reacts
+        // ~15s faster than the windowed telemetry during load swings,
+        // which is exactly why mixing the two never balanced).
+        if let snap = batterySnap, snap.telemetrySystemLoadW != nil {
+            lastSystemLoadW = snap.telemetrySystemLoadW
+            lastDcInW = snap.telemetrySystemPowerInW
+            lastBatteryFlowW = snap.telemetryBatteryPowerW
+            lastTelemetryAt = Date()
         }
-        let telemetryFresh = lastSystemLoadW != nil
-            && lastSystemLoadAt.map { Date().timeIntervalSince($0) < Self.systemLoadMaxAge } == true
-        let rawSystemEff = telemetryFresh ? lastSystemLoadW! : rawSystem
+        let telemetryFresh = lastTelemetryAt.map {
+            Date().timeIntervalSince($0) < Self.systemLoadMaxAge
+        } == true
+        let rawSystemEff = (telemetryFresh ? lastSystemLoadW : nil) ?? rawSystem
+        let rawDcInEff = (telemetryFresh ? lastDcInW : nil) ?? rawDcIn
+        let rawFlowEff = (telemetryFresh ? lastBatteryFlowW : nil)
+            ?? battery?.instantBatteryPowerW
+            ?? battery?.batteryPowerW
+            ?? 0
+
+        let nowCharging = rawDcInEff > Self.chargingThreshold
 
         // Reset smoothing on charger connect/disconnect
         if isFirstReading || nowCharging != wasCharging {
             wattage = rawSystemEff
-            dcInWattage = rawDcIn
+            dcInWattage = rawDcInEff
+            batteryFlowWattage = rawFlowEff
             isFirstReading = false
             wasCharging = nowCharging
             wattageHistory.removeAll()
@@ -312,7 +347,8 @@ class PowerMonitor: ObservableObject {
             windowSampleCount = 0
         } else {
             wattage += smoothingAlpha * (rawSystemEff - wattage)
-            dcInWattage += smoothingAlpha * (rawDcIn - dcInWattage)
+            dcInWattage += smoothingAlpha * (rawDcInEff - dcInWattage)
+            batteryFlowWattage += smoothingAlpha * (rawFlowEff - batteryFlowWattage)
         }
 
         // Track rolling 5-minute history for time estimates
@@ -345,27 +381,42 @@ class PowerMonitor: ObservableObject {
                 let avgSystem = windowSystemSum / Double(windowSampleCount)
                 let avgScreen = windowScreenSum / Double(windowSampleCount)
                 // Signed gap over the same window the IOReport delta covers.
-                // Once the Energy Model is known-bogus its (junk) total is
-                // no longer subtracted — the gap is then the whole SoC.
-                let metered = ioReportUnreliable ? 0 : io.totalMeteredWatts
+                // The Energy Model total is only subtracted once proven
+                // reliable — otherwise the gap is the whole SoC.
+                let metered = ioReportTrusted ? io.totalMeteredWatts : 0
                 let gap = avgSystem - avgScreen - metered
                 let prev = smoothedGapW ?? gap
                 smoothedGapW = prev + Self.gapSmoothingAlpha * (gap - prev)
 
                 // Reliability watchdog: cumulative energy coverage of the
-                // Energy Model vs (system − screen). On machines where the
-                // counters are broken (macOS 27 beta / M4: erratic updates,
-                // ~14% coverage) the breakdown is degraded for the session.
-                if !ioReportUnreliable, avgSystem - avgScreen > 3 {
+                // Energy Model vs (system − screen). Broken counters
+                // (macOS 27 beta / M4: erratic updates, ~14% coverage)
+                // must never render as "CPU 0.0W" + a huge residual. The
+                // verdict persists across launches and can flip back if a
+                // later OS fixes the counters.
+                if avgSystem - avgScreen > 3 {
                     ioCoverageIoSum += io.totalMeteredWatts
                     ioCoverageTargetSum += avgSystem - avgScreen
                     ioCoverageSamples += 1
-                    if ioCoverageSamples >= Self.ioCoverageMinSamples,
-                       ioCoverageIoSum / ioCoverageTargetSum < Self.ioCoverageMinRatio {
-                        ioReportUnreliable = true
-                        print("PowerMonitor: IOReport Energy Model coverage "
-                              + String(format: "%.0f%%", 100 * ioCoverageIoSum / ioCoverageTargetSum)
-                              + " — degrading per-component breakdown")
+                    if ioCoverageSamples >= Self.ioCoverageMinSamples, ioCoverageTargetSum > 0 {
+                        let ratio = ioCoverageIoSum / ioCoverageTargetSum
+                        var verdict = ioVerdictUnreliable
+                        if ratio < Self.ioUnreliableBelow {
+                            verdict = true
+                        } else if ratio > Self.ioReliableAbove {
+                            verdict = false
+                        } else if verdict == nil {
+                            // Mid-band with no prior verdict: decide at the
+                            // midpoint rather than staying in limbo forever
+                            verdict = ratio < (Self.ioUnreliableBelow + Self.ioReliableAbove) / 2
+                        }
+                        if verdict != ioVerdictUnreliable {
+                            ioVerdictUnreliable = verdict
+                            UserDefaults.standard.set(verdict, forKey: Self.ioVerdictDefaultsKey)
+                            print("PowerMonitor: Energy Model coverage "
+                                  + String(format: "%.0f%%", 100 * ratio)
+                                  + " — breakdown \(verdict == true ? "degraded" : "enabled")")
+                        }
                     }
                 }
             }
@@ -386,6 +437,12 @@ class PowerMonitor: ObservableObject {
         if let snap = batterySnap {
             battery = snap
             usbPortPower = snap.usbPortPower
+            if !snap.usbPortPower.isEmpty, !hasSeenPortPower {
+                // This machine measures USB power per port — remember, so
+                // the residual is never labeled "USB/Ext" here again.
+                hasSeenPortPower = true
+                UserDefaults.standard.set(true, forKey: Self.portPowerDefaultsKey)
+            }
             if let batteryW = snap.batteryPowerW, batteryW < -0.05 {
                 dischargePowerHistory.append(-batteryW)
                 if dischargePowerHistory.count > Self.dischargeHistorySize {
@@ -434,7 +491,8 @@ class PowerMonitor: ObservableObject {
             "gapW": smoothedGapW ?? 0,
             "avgW5m": averageWattage,
             "hlTelemetry": lastSystemLoadW != nil ? 1 : 0,
-            "ioUnreliable": ioReportUnreliable ? 1 : 0,
+            "batteryFlowEMA": batteryFlowWattage,
+            "ioVerdict": ioVerdictUnreliable.map { $0 ? 1 : 0 } ?? -1,
         ]
         if let avgDischarge = averageDischargeWatts {
             derived["avgDischargeW5m"] = avgDischarge
@@ -475,7 +533,7 @@ class PowerMonitor: ObservableObject {
     private func buildBreakdown(rawScreen: Double) -> [PowerComponent] {
         var components: [PowerComponent] = []
 
-        if let io = lastIOReportBreakdown, !ioReportUnreliable {
+        if let io = lastIOReportBreakdown, ioReportTrusted {
             // IOReport values shown as-is (no scaling).
             // These are actual energy counter measurements from the SoC.
             components.append(smoothedComponent("CPU", raw: io.cpuWatts))
@@ -523,15 +581,21 @@ class PowerMonitor: ObservableObject {
             let pdTotal = usbPortPower.reduce(0.0) { $0 + $1.watts }
             let residual = (smoothedGapW ?? 0) - pdTotal
             if residual > 0.1 {
-                components.append(PowerComponent(label: "Other", watts: residual))
+                components.append(PowerComponent(
+                    label: ioReportTrusted ? "Other" : "SoC/Other", watts: residual))
             }
         } else {
-            // Only call the gap "USB/Ext" when IOReport is actually
-            // metering the SoC; otherwise the gap IS mostly the SoC, so
-            // label it honestly.
-            let residualLabel = (lastIOReportBreakdown != nil && !ioReportUnreliable)
-                ? "USB/Ext"
-                : (ioReportUnreliable ? "SoC/Other" : "Other")
+            // Label the gap by what it actually contains: with a trusted
+            // Energy Model and no per-port USB measurement it's external
+            // power ("USB/Ext"); with per-port measurement present on this
+            // machine USB is accounted elsewhere ("Other"); without a
+            // trusted Energy Model it's mostly the SoC itself.
+            let residualLabel: String
+            if ioReportTrusted {
+                residualLabel = hasSeenPortPower ? "Other" : "USB/Ext"
+            } else {
+                residualLabel = "SoC/Other"
+            }
             let gap = smoothedGapW ?? 0
             // Floor small values to zero to avoid jitter around 0
             components.append(PowerComponent(label: residualLabel, watts: gap < 0.5 ? 0.0 : gap))
