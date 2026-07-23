@@ -93,11 +93,20 @@ exact energy balance `SystemPowerIn = SystemLoad + BatteryPower` (holds to
 | Capacity keys | `AppleRaw*`/`NominalChargeCapacity`/`DesignCapacity`/`CellVoltage`/`Temperature` absent from top level on macOS 27; gauge lives in `BatteryData.{RemainingCapacity, FullChargeCapacity, …}`; the app's interpolated Wh never ran all week because of this | BatteryData fallback chain; temp row hidden at 0 |
 | Sanity checks | design 6249 mAh × 11.55 V = 72.2 Wh ≈ 72.4 Wh spec; FCC 5882 → health 94%; coulomb counter vs Δremaining agrees ~±10% per segment | — |
 
-Open for round 2: verify SystemLoad headline behavior on AC vs the old
-PSTR feel, confirm the coulomb interpolation's sub-percent smoothness,
-collect `NotChargingReason` bit meanings (values seen: 128, 0x1000000,
-0x1000080, 0x400081…), and re-measure IOReport coverage with the window
-in place.
+**Fusion architecture (post round 1.2):** driving the display directly
+from telemetry made unplugging take ~30s to register (the windowed values
+trail transients by up to ~15s). Final design: instant sensors drive all
+dynamics and state detection (PSTR for system, PDTR for DC-in/charging,
+gauge V×A for battery flow); telemetry contributes only a slowly-learned
+level bias on PSTR (updated only in steady load, clamped to
+max(2 W, 25%)), plus the Adapter Loss row. State detection must never use
+a windowed source.
+
+Open for round 2: verify the learned PSTR bias against SystemLoad in the
+logs (`derived.sysBias`), confirm the coulomb interpolation's sub-percent
+smoothness, collect `NotChargingReason` bit meanings (values seen: 128,
+0x1000000, 0x1000080, 0x400081…), and re-measure IOReport coverage with
+the window in place.
 
 ## Notes
 

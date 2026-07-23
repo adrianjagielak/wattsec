@@ -53,17 +53,19 @@ class PowerMonitor: ObservableObject {
 
     // MARK: - Published State
 
-    /// Smoothed system power consumption. Source: PowerTelemetryData
-    /// SystemLoad when available (matches true battery drain to ~1% in
-    /// logged data), falling back to SMC PSTR (which under-reads by ~5%
-    /// on average on newer machines).
+    /// Smoothed system power consumption.
+    /// Fusion: instant SMC PSTR drives the dynamics; a slowly-learned
+    /// bias corrects its level toward telemetry SystemLoad (which matches
+    /// true battery drain to ~1% but trails transients by up to ~15s —
+    /// it must never drive the display directly).
     @Published var wattage: Double = 0.0
     /// Smoothed DC input power — non-zero when charger connected.
-    /// Source: telemetry SystemPowerIn when fresh (same snapshot as the
-    /// system/battery values, so the rows add up), SMC PDTR fallback.
+    /// Source: SMC PDTR, always. It is instant and already equals
+    /// telemetry SystemPowerIn to ~1% in energy; windowed sources here
+    /// made unplugging take 30s to register.
     @Published var dcInWattage: Double = 0.0
-    /// Smoothed battery charge(+)/discharge(−) power. Same telemetry
-    /// snapshot as wattage/dcInWattage when available, gauge V×A fallback.
+    /// Smoothed battery charge(+)/discharge(−) power from the gauge's
+    /// instantaneous V×A (1s cadence, no windowing).
     @Published var batteryFlowWattage: Double = 0.0
     /// Latest battery snapshot (updated every ~1 second)
     @Published var battery: BatterySnapshot?
@@ -175,15 +177,15 @@ class PowerMonitor: ObservableObject {
     /// Gauge coulomb counter (mAh) at the last interpolation step
     private var lastRemainingMAh: Int?
 
-    /// Latest telemetry values (held between ~1s battery reads; ignored
-    /// when stale). SystemPowerIn = SystemLoad + BatteryPower is an exact
-    /// identity in this telemetry, so sourcing System / DC In / To Battery
-    /// from the same snapshot makes the displayed rows add up exactly —
-    /// mixing time bases (fast SMC vs windowed telemetry) does not.
-    private var lastSystemLoadW: Double?
-    private var lastDcInW: Double?
-    private var lastBatteryFlowW: Double?
-    private var lastTelemetryAt: Date?
+    /// Level correction for PSTR, learned from telemetry SystemLoad.
+    /// PSTR under-reads true drain by ~5% on average (0.79–1.11 per
+    /// segment in logged data); SystemLoad is accurate but windowed.
+    /// The bias is updated only while the load is steady, so the
+    /// telemetry's transient lag can never corrupt it, and it is kept
+    /// small relative to PSTR so the fast sensor always dominates.
+    private var systemBias: Double = 0
+    /// Last ~5s of raw PSTR ticks, for the steadiness test
+    private var recentRawSystem: [Double] = []
 
     /// IOReport reliability watchdog. On some machines (observed on
     /// Mac16,6 / macOS 27) the Energy Model counters update erratically —
@@ -222,8 +224,11 @@ class PowerMonitor: ObservableObject {
     /// nominal display scale — energy actually deliverable is ~1.5% less
     /// than the nominal-scale Wh suggests. Applied to time estimates only.
     static let dischargeEnergyFactor = 0.985
-    /// Telemetry values older than this fall back to SMC/gauge sources
-    private static let systemLoadMaxAge: TimeInterval = 5.0
+    /// Steadiness test for bias learning: last 5s of PSTR within this span
+    private static let steadySpanW = 1.5
+    private static let steadyTicks = 25
+    /// Bias EMA per steady telemetry sample (~1/s): τ ≈ 10s of steady load
+    private static let biasAlpha = 0.1
     /// Coverage watchdog: decide after ~1 minute of loaded samples;
     /// hysteresis so the verdict can flip only on clear evidence
     private static let ioCoverageMinSamples = 60
@@ -307,33 +312,44 @@ class PowerMonitor: ObservableObject {
         batterySnap: BatterySnapshot?,
         ioBreakdown: IOReportPowerBreakdown?
     ) {
-        // Hold the latest telemetry (SystemPowerIn = SystemLoad +
-        // BatteryPower is exact within one snapshot — sourcing all three
-        // displayed values from it makes the menu add up; SMC PDTR reacts
-        // ~15s faster than the windowed telemetry during load swings,
-        // which is exactly why mixing the two never balanced).
-        if let snap = batterySnap, snap.telemetrySystemLoadW != nil {
-            lastSystemLoadW = snap.telemetrySystemLoadW
-            lastDcInW = snap.telemetrySystemPowerInW
-            lastBatteryFlowW = snap.telemetryBatteryPowerW
-            lastTelemetryAt = Date()
+        // Sensor fusion for the headline. PSTR is instant but under-reads
+        // the true drain by ~5% on average; telemetry SystemLoad is
+        // accurate but windowed (trails transients by up to ~15s). Learn
+        // a level bias from SystemLoad ONLY while the load is steady —
+        // during transients the fast sensor runs uncorrected, so unplug/
+        // load changes show up within one tick, never 30s late.
+        recentRawSystem.append(rawSystem)
+        if recentRawSystem.count > Self.steadyTicks {
+            recentRawSystem.removeFirst()
         }
-        let telemetryFresh = lastTelemetryAt.map {
-            Date().timeIntervalSince($0) < Self.systemLoadMaxAge
-        } == true
-        let rawSystemEff = (telemetryFresh ? lastSystemLoadW : nil) ?? rawSystem
-        let rawDcInEff = (telemetryFresh ? lastDcInW : nil) ?? rawDcIn
-        let rawFlowEff = (telemetryFresh ? lastBatteryFlowW : nil)
-            ?? battery?.instantBatteryPowerW
-            ?? battery?.batteryPowerW
-            ?? 0
+        let steady = recentRawSystem.count == Self.steadyTicks
+            && (recentRawSystem.max()! - recentRawSystem.min()!) < Self.steadySpanW
+        if steady, let loadW = batterySnap?.telemetrySystemLoadW {
+            systemBias += Self.biasAlpha * ((loadW - rawSystem) - systemBias)
+        }
+        // The measured correction is a few watts at most — never let the
+        // slow reference dominate the fast sensor.
+        let biasLimit = max(2.0, 0.25 * rawSystem)
+        systemBias = min(max(systemBias, -biasLimit), biasLimit)
+        let rawSystemEff = max(0, rawSystem + systemBias)
 
-        let nowCharging = rawDcInEff > Self.chargingThreshold
+        // DC In and charging state: instant SMC PDTR, always
+        // (≈ telemetry SystemPowerIn to ~1% in energy, but with no lag).
+        let nowCharging = rawDcIn > Self.chargingThreshold
 
-        // Reset smoothing on charger connect/disconnect
+        // Battery flow: gauge instantaneous V×A from the freshest snapshot
+        let rawFlowEff = (batterySnap ?? battery).flatMap {
+            $0.instantBatteryPowerW ?? $0.batteryPowerW
+        } ?? 0
+
+        // Reset smoothing on charger connect/disconnect. The PSTR bias
+        // differs by power state (fitted: −0.7W on battery, +0.6W while
+        // charging), so it re-learns from scratch after a transition.
         if isFirstReading || nowCharging != wasCharging {
-            wattage = rawSystemEff
-            dcInWattage = rawDcInEff
+            systemBias = 0
+            recentRawSystem.removeAll()
+            wattage = rawSystem
+            dcInWattage = rawDcIn
             batteryFlowWattage = rawFlowEff
             isFirstReading = false
             wasCharging = nowCharging
@@ -347,7 +363,7 @@ class PowerMonitor: ObservableObject {
             windowSampleCount = 0
         } else {
             wattage += smoothingAlpha * (rawSystemEff - wattage)
-            dcInWattage += smoothingAlpha * (rawDcInEff - dcInWattage)
+            dcInWattage += smoothingAlpha * (rawDcIn - dcInWattage)
             batteryFlowWattage += smoothingAlpha * (rawFlowEff - batteryFlowWattage)
         }
 
@@ -490,7 +506,7 @@ class PowerMonitor: ObservableObject {
             "dcInEMA": dcInWattage,
             "gapW": smoothedGapW ?? 0,
             "avgW5m": averageWattage,
-            "hlTelemetry": lastSystemLoadW != nil ? 1 : 0,
+            "sysBias": systemBias,
             "batteryFlowEMA": batteryFlowWattage,
             "ioVerdict": ioVerdictUnreliable.map { $0 ? 1 : 0 } ?? -1,
         ]

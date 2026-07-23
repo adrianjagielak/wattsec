@@ -490,9 +490,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if monitor.isCharging {
             powerDcInItem?.title = "DC In    " + String(format: fmt, monitor.dcInWattage)
             powerDcInItem?.isHidden = false
-            // Same telemetry snapshot + smoothing as System and DC In, so
-            // the three rows add up (DC In = System + To Battery is an
-            // exact identity in PowerTelemetryData).
+            // Gauge-measured battery flow. Rows come from different
+            // sensors, so they can disagree ~1W during transients — that
+            // honesty is preferred over a windowed source that lags
+            // reality by tens of seconds.
             let batteryW = monitor.batteryFlowWattage
             if batteryW >= 0 {
                 powerNetItem?.title = "To Battery    " + String(format: fmt, batteryW)
